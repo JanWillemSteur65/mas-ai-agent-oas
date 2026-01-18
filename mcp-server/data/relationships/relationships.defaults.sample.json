@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "note": "Copy this file to /data/relationships/relationships.defaults.json (global) or /data/relationships/relationships.<tenant>.json (per-tenant). Tenant overrides win.",
+  "relationships": {
+    "mxapiwo": {
+      "asset": {
+        "relatedOs": "mxapiasset",
+        "rootJoinField": "assetnum",
+        "relatedKeyField": "assetnum",
+        "relatedSiteField": "siteid",
+        "maxKeys": 50,
+        "pageSize": 200,
+        "select": "assetnum"
+      },
+      "location": {
+        "relatedOs": "mxapilocations",
+        "rootJoinField": "location",
+        "relatedKeyField": "location",
+        "relatedSiteField": "siteid",
+        "maxKeys": 50,
+        "pageSize": 200,
+        "select": "location"
+      }
+    },
+    "mxapisr": {
+      "asset": {
+        "relatedOs": "mxapiasset",
+        "rootJoinField": "assetnum",
+        "relatedKeyField": "assetnum",
+        "relatedSiteField": "siteid",
+        "maxKeys": 50,
+        "pageSize": 200,
+        "select": "assetnum"
+      }
+    },
+    "mxapipo": {
+      "vendor": {
+        "relatedOs": "mxapivendor",
+        "rootJoinField": "vendor",
+        "relatedKeyField": "vendor",
+        "relatedSiteField": null,
+        "maxKeys": 50,
+        "pageSize": 200,
+        "select": "vendor"
+      }
+    },
+    "mxapipr": {
+      "vendor": {
+        "relatedOs": "mxapivendor",
+        "rootJoinField": "vendor",
+        "relatedKeyField": "vendor",
+        "relatedSiteField": null,
+        "maxKeys": 50,
+        "pageSize": 200,
+        "select": "vendor"
+      }
+    }
+  }
+}

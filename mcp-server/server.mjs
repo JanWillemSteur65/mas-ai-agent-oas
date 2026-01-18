@@ -1,0 +1,5455 @@
+// mcp-server/server.mjs
+import express from "express";
+import helmet from "helmet";
+import morgan from "morgan";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import fetch from "node-fetch";
+
+// ✅ NEW: redaction policy engine (best-effort, safe by default)
+import { applyRedactionPolicy } from "./redaction.js";
+// ✅ NEW: generic relationship-prefetch executor (inlined to avoid missing-module issues)
+const { applyRelationshipPrefetch } = (() => {
+// mcp-server/relprefetch.mjs
+// Generic relationship-prefetch planner/executor for Maximo OSLC queries.
+//
+// Supports filters like `asset.assettype="SENSOR"` even when the root OS doesn't expose
+// a joinable relationship path for that field.
+//
+// Usage (from server.mjs):
+//   const { plan } = await applyRelationshipPrefetch({ tenantId, t, os, params, defaultSite, rxId, maximoFetch, authHeaders, maximoApiBase });
+//   // params may be mutated in-place; plan can be attached to response._mcp.plan
+
+
+function safeJson(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+function getOslcMembers(body) {
+  if (!body || typeof body !== "object") return [];
+  const m1 = body?.member;
+  const m2 = body?.["rdfs:member"];
+  // Some environments put `member` as a list of lists.
+  const one = Array.isArray(m1) ? m1 : Array.isArray(m2) ? m2 : [];
+  if (one.length === 1 && Array.isArray(one[0])) return one[0];
+  return one;
+}
+
+function normalizeOp(opRaw) {
+  const op = String(opRaw || "").trim().toLowerCase();
+  if (op === "=") return "=";
+  if (op === "!=") return "!=";
+  if (op === "like") return "like";
+  // treat default as equals
+  return "=";
+}
+
+function escapeWhereString(v) {
+  // OSLC uses double quotes for literals; escape embedded quotes.
+  return String(v ?? "").replace(/"/g, "\\\"");
+}
+
+function detectRelationshipPredicates(where) {
+  // Detect simple predicates of the form:
+  //   rel.field = "..."
+  //   rel.field != "..."
+  //   rel.field like "..."
+  // And also accept single quoted literals.
+  const w = String(where || "");
+  const preds = [];
+
+  // Capture: rel, field, op, quote, value
+  const re = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*(=|!=|\blike\b)\s*("([^"]*)"|'([^']*)')/gi;
+  let m;
+  while ((m = re.exec(w))) {
+    const rel = String(m[1]).trim();
+    const field = String(m[2]).trim();
+    const op = normalizeOp(m[3]);
+    const val = (typeof m[5] === "string" ? m[5] : m[6]) ?? "";
+    preds.push({ rel, field, op, value: String(val) });
+  }
+  return preds;
+}
+
+function buildOrBlock(rootJoinField, keys) {
+  const parts = keys.map((k) => `${rootJoinField}="${escapeWhereString(k)}"`);
+  return `(${parts.join(" or ")})`;
+}
+
+function loadRelationshipsConfig({ dataDir, tenantId }) {
+  // Priority:
+  //  1) /data/relationships/relationships.<tenantId>.json
+  //  2) /data/relationships/relationships.defaults.json
+  //  3) built-in defaults in this module
+  const relDir = path.join(dataDir, "relationships");
+  const tenantFile = path.join(relDir, `relationships.${tenantId}.json`);
+  const defaultsFile = path.join(relDir, "relationships.defaults.json");
+
+  const builtIn = {
+    version: 1,
+    relationships: {
+      // Work Orders
+      mxapiwo: {
+        asset: {
+          relatedOs: "mxapiasset",
+          rootJoinField: "assetnum",
+          relatedKeyField: "assetnum",
+          relatedSiteField: "siteid",
+          maxKeys: 50,
+          pageSize: 200,
+          select: "assetnum"
+        },
+        location: {
+          relatedOs: "mxapilocations",
+          rootJoinField: "location",
+          relatedKeyField: "location",
+          relatedSiteField: "siteid",
+          maxKeys: 50,
+          pageSize: 200,
+          select: "location"
+        }
+      },
+      // Service Requests
+      mxapisr: {
+        asset: {
+          relatedOs: "mxapiasset",
+          rootJoinField: "assetnum",
+          relatedKeyField: "assetnum",
+          relatedSiteField: "siteid",
+          maxKeys: 50,
+          pageSize: 200,
+          select: "assetnum"
+        }
+      },
+      // Purchase Orders / Purchase Reqs (vendor relationship)
+      // NOTE: join fields vary by tenant; override these in relationships.<tenant>.json
+      mxapipo: {
+        vendor: {
+          relatedOs: "mxapivendor",
+          rootJoinField: "vendor",
+          relatedKeyField: "vendor",
+          relatedSiteField: "siteid",
+          maxKeys: 50,
+          pageSize: 200,
+          select: "vendor"
+        }
+      },
+      mxapipr: {
+        vendor: {
+          relatedOs: "mxapivendor",
+          rootJoinField: "vendor",
+          relatedKeyField: "vendor",
+          relatedSiteField: "siteid",
+          maxKeys: 50,
+          pageSize: 200,
+          select: "vendor"
+        }
+      }
+    }
+  };
+
+  let defaults = null;
+  let tenant = null;
+
+  try {
+    if (fs.existsSync(defaultsFile)) {
+      defaults = safeJson(fs.readFileSync(defaultsFile, "utf8"));
+    }
+  } catch {}
+
+  try {
+    if (fs.existsSync(tenantFile)) {
+      tenant = safeJson(fs.readFileSync(tenantFile, "utf8"));
+    }
+  } catch {}
+
+  // Merge: builtIn <- defaults <- tenant
+  const out = structuredClone(builtIn);
+  if (defaults?.relationships && typeof defaults.relationships === "object") {
+    out.relationships = { ...out.relationships, ...defaults.relationships };
+  }
+  if (tenant?.relationships && typeof tenant.relationships === "object") {
+    out.relationships = { ...out.relationships, ...tenant.relationships };
+  }
+  return out;
+}
+
+async function prefetchKeys({
+  t,
+  rxId,
+  apiBase,
+  authHeaders,
+  maximoFetch,
+  relatedOs,
+  relatedWhere,
+  select,
+  pageSize,
+  relatedKeyField,
+}) {
+  const q = new URLSearchParams();
+  q.set("lean", "1");
+  q.set("oslc.pageSize", String(pageSize || 200));
+  q.set("oslc.select", select || relatedKeyField);
+  q.set("oslc.where", relatedWhere);
+
+  const url = `${apiBase}/os/${encodeURIComponent(relatedOs)}?${q.toString()}`;
+  const r2 = await maximoFetch(t, { method: "GET", url, headers: authHeaders(t), kind: "tx_maximo", title: `→ Maximo OS ${relatedOs} (prefetch)`, meta: { relatedId: rxId } });
+
+  // maximoFetch returns { r, respText } in some call sites, and sometimes a parsed JSON body in others.
+  // In this server, the helper in the hardcoded block treated it as already parsed.
+  // Here, be defensive.
+  let body = r2;
+  if (r2 && typeof r2 === "object" && r2.r && typeof r2.respText === "string") {
+    // Alternate shape
+    body = safeJson(r2.respText) ?? { raw: r2.respText };
+  }
+
+  const members = getOslcMembers(body);
+  const keys = members.map((it) => it?.[relatedKeyField]).filter(Boolean).map((x) => String(x).trim());
+  return { keys, rawCount: keys.length };
+}
+
+async function applyRelationshipPrefetch({ tenantId, t, os, params, defaultSite, rxId, maximoFetch, authHeaders, maximoApiBase }) {
+  const plan = {
+    mode: "none",
+    detected: [],
+    steps: [],
+    truncated: false,
+    errors: []
+  };
+
+  try {
+    const where = String(params?.["oslc.where"] || "");
+    if (!where) return { plan };
+
+    const dataDir = String(process.env.DATA_DIR || "/data");
+    const cfg = loadRelationshipsConfig({ dataDir, tenantId });
+    const relsForOs = cfg?.relationships?.[String(os || "").toLowerCase()] || cfg?.relationships?.[String(os || "")] || null;
+
+    const preds = detectRelationshipPredicates(where);
+    if (!preds.length) return { plan };
+    plan.detected = preds;
+
+    // For safety, only rewrite predicates we have a configured relationship for.
+    const apiBase = maximoApiBase(t);
+
+    let mutatedWhere = where;
+
+    for (const p of preds) {
+      const relName = String(p.rel || "");
+      const relCfg = relsForOs?.[relName];
+      if (!relCfg) continue;
+
+      const relatedOs = String(relCfg.relatedOs || "").trim();
+      const rootJoinField = String(relCfg.rootJoinField || "").trim();
+      const relatedKeyField = String(relCfg.relatedKeyField || "").trim();
+      const relatedSiteField = String(relCfg.relatedSiteField || "").trim();
+      const select = String(relCfg.select || "").trim() || relatedKeyField;
+      const pageSize = Number(relCfg.pageSize || 200);
+      const maxKeys = Number(relCfg.maxKeys || process.env.MAX_PREFETCH_KEYS || 50);
+
+      if (!relatedOs || !rootJoinField || !relatedKeyField) continue;
+
+      // Build the related where
+      const val = escapeWhereString(p.value);
+      const op = p.op === "like" ? "like" : (p.op === "!=" ? "!=" : "=");
+
+      let relWhere = `${p.field} ${op} "${val}"`;
+      if (defaultSite && relatedSiteField) {
+        // Do not double-add if caller already filtered by siteid (best-effort)
+        if (!/(^|\W)siteid\s*(=|!=|\bin\b)/i.test(relWhere)) {
+          relWhere = `${relatedSiteField}="${escapeWhereString(defaultSite)}" and ${relWhere}`;
+        }
+      }
+
+      plan.mode = "prefetch";
+      plan.steps.push({
+        kind: "prefetch",
+        relationship: relName,
+        relatedOs,
+        relatedWhere: relWhere,
+        select,
+        rootJoinField,
+        relatedKeyField,
+        maxKeys
+      });
+
+      let keys = [];
+      try {
+        const out = await prefetchKeys({
+          t,
+          rxId,
+          apiBase,
+          authHeaders,
+          maximoFetch,
+          relatedOs,
+          relatedWhere: relWhere,
+          select,
+          pageSize,
+          relatedKeyField,
+        });
+        keys = (out.keys || []).slice(0, Math.max(0, maxKeys));
+        if ((out.keys || []).length > keys.length) plan.truncated = true;
+
+        plan.steps.push({
+          kind: "prefetch_result",
+          relationship: relName,
+          keysReturned: (out.keys || []).length,
+          keysUsed: keys.length
+        });
+      } catch (e) {
+        plan.errors.push({ relationship: relName, message: String(e?.message || e) });
+        continue;
+      }
+
+      if (!keys.length) {
+        // No matching related rows; rewrite the predicate to something that yields no root rows.
+        // Using a false clause is safer than returning everything.
+        const falseClause = `${rootJoinField}="__NO_MATCH__"`;
+        const clauseRe = new RegExp(`\\b${relName}\\s*\\.\\s*${p.field}\\s*(=|!=|\\blike\\b)\\s*(\"[^\"]*\"|'[^']*')`, "i");
+        mutatedWhere = mutatedWhere.replace(clauseRe, falseClause);
+        plan.steps.push({ kind: "rewrite", relationship: relName, replacedWith: falseClause, note: "no related matches" });
+        continue;
+      }
+
+      const orBlock = buildOrBlock(rootJoinField, keys);
+
+      // Replace ONLY this clause occurrence.
+      const clauseRe = new RegExp(`\\b${relName}\\s*\\.\\s*${p.field}\\s*(=|!=|\\blike\\b)\\s*(\"[^\"]*\"|'[^']*')`, "i");
+      mutatedWhere = mutatedWhere.replace(clauseRe, orBlock);
+
+      plan.steps.push({ kind: "rewrite", relationship: relName, replacedWith: orBlock });
+    }
+
+    if (mutatedWhere !== where) {
+      params["oslc.where"] = mutatedWhere;
+    }
+
+    return { plan };
+  } catch (e) {
+    plan.mode = "error";
+    plan.errors.push({ message: String(e?.message || e) });
+    return { plan };
+  }
+}
+  return { applyRelationshipPrefetch };
+})();
+
+// ✅ NEW: generic relationship-prefetch executor (replaces hardcoded relationship special-cases)
+import { ensureUsersFile, readUsers, writeUsers, findUser, verifyPassword, hashPassword, createToken, setAuthCookie, clearAuthCookie, authMiddleware, requireAuth, requireAdmin } from "./auth.mjs";
+
+const app = express();
+
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: false,
+  })
+);
+app.use(morgan("combined"));
+app.use(express.json({ limit: "10mb" }));
+
+
+app.set("trust proxy", 1);
+
+// --- Simple built-in authentication (cookie session) ---
+const AUTH_SECRET = process.env.AUTH_SECRET || "change-me-in-prod";
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "ReAtEt-wAInve-M0UsER";
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || process.env.MCP_INTERNAL_TOKEN || "";
+const DATA_DIR = process.env.DATA_DIR || "/data";
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+// Tenants persistence
+// - Primary (requested): /data/tenant.json
+// - Legacy (backward compatible): /data/tenants.json
+const TENANTS_FILE_PRIMARY = path.join(DATA_DIR, "tenant.json");
+const TENANTS_FILE_LEGACY = path.join(DATA_DIR, "tenants.json");
+
+ensureUsersFile(USERS_FILE, DEFAULT_ADMIN_PASSWORD);
+
+// Populate req.user if session cookie is present
+app.use(authMiddleware(AUTH_SECRET));
+
+
+function requireInternalOrAdmin() {
+  return function(req, res, next) {
+    const hdr = String(req.headers["x-internal-token"] || "").trim();
+    if (INTERNAL_TOKEN && hdr && hdr === INTERNAL_TOKEN) return next();
+    if (req.user && req.user.role === "admin") return next();
+    return res.status(403).json({ error: "forbidden" });
+  };
+}
+
+// Protect all /api routes except auth + health
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api") &&
+      !req.path.startsWith("/api/auth") &&
+      req.path !== "/api/health" &&
+      req.path !== "/api/help") {
+    return requireAuth()(req, res, next);
+  }
+  return next();
+});
+
+// Help HTML is served by the MCP server itself so other UIs can reuse it.
+// This endpoint is intentionally unauthenticated (docs only).
+const HELP_HTML = `<!doctype html><html><body>
+<h1>MCP Server Help &amp; Architecture Guide</h1>
+<p>This page describes how the <strong>MCP Server</strong> works, how it communicates with the <strong>AI Agent</strong> and <strong>IBM Maximo</strong>, and how to use the <strong>MCP Server Observability UI</strong>.</p>
+<hr />
+<h2>Key endpoints</h2>
+<ul>
+  <li><code>GET /mcp/tools</code> — discover tools</li>
+  <li><code>POST /mcp/call</code> — execute a tool</li>
+  <li><code>POST /api/auth/login</code> — login (UI)</li>
+  <li><code>POST /api/auth/verify</code> — verify credentials (for AI Agent)</li>
+</ul>
+<h2>Where users live</h2>
+<p>Users are stored in <code>/data/users.json</code>. The AI Agent can be configured to validate against this store by setting <code>AUTH_SERVER_URL</code> (or <code>MCP_URL</code>) to this MCP server.</p>
+<hr />
+<p><em>Tip:</em> For full details, see the Help section in the MCP Server UI.</p>
+</body></html>`;
+
+app.get("/api/help", (_req, res) => {
+  res.type("text/html").send(HELP_HTML);
+});
+
+// ---- Auth endpoints ----
+app.post("/api/auth/login", (req, res) => {
+  const { username, password } = req.body || {};
+  try {
+    const users = readUsers(USERS_FILE);
+    const u = findUser(users, username);
+    if (!u || !verifyPassword(password, u.salt, u.hash)) {
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+    const token = createToken(AUTH_SECRET, u.username, u.role);
+    const secure = String(process.env.COOKIE_SECURE || "").toLowerCase() === "true";
+    setAuthCookie(res, token, secure);
+    return res.json({ username: u.username, role: u.role });
+  } catch (e) {
+    console.error("login error", e);
+    return res.status(500).json({ error: "auth_error" });
+  }
+});
+
+app.get("/api/auth/me", (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "unauthorized" });
+  res.json(req.user);
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const secure = String(process.env.COOKIE_SECURE || "").toLowerCase() === "true";
+  clearAuthCookie(res, secure);
+  res.json({ ok: true });
+});
+
+// For the AI Agent to validate credentials against the MCP's user store
+app.post("/api/auth/verify", (req, res) => {
+  const { username, password } = req.body || {};
+  try {
+    const users = readUsers(USERS_FILE);
+    const u = findUser(users, username);
+    if (!u || !verifyPassword(password, u.salt, u.hash)) {
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+    return res.json({ ok: true, username: u.username, role: u.role });
+  } catch (e) {
+    console.error("verify error", e);
+    return res.status(500).json({ error: "auth_error" });
+  }
+});
+
+// --- Help (served by backend; no external file dependency) ---
+// Note: kept unprotected so the AI Agent can reuse it without needing MCP cookies.
+const MCP_HELP_HTML = `<!doctype html><html><body>
+<h1>MCP-Server Help &amp; Architecture Guide</h1>
+<p>This document describes how the <strong>MCP Server</strong> works and how it communicates with the <strong>AI Agent</strong> and <strong>IBM Maximo</strong>.</p>
+<hr />
+<h2>1. Key Endpoints</h2>
+<ul>
+  <li><code>GET /mcp/tools</code> – discover available tools</li>
+  <li><code>POST /mcp/call</code> – execute a tool</li>
+  <li><code>/api/*</code> – UI + settings + logs endpoints (most require login)</li>
+</ul>
+<h2>2. Authentication</h2>
+<p>The MCP Server uses a cookie session (<code>session</code>) after successful login via <code>POST /api/auth/login</code>. Users are stored in <code>/data/users.json</code>.</p>
+<h2>3. Observability</h2>
+<p>The MCP UI shows logs, tool calls, and (optional) HTTP trace. Enable tracing via the server settings if required.</p>
+</body></html>`;
+
+app.get("/api/help", (_req, res) => {
+  res.type("text/html").send(MCP_HELP_HTML);
+});
+
+// ---- User management (admin only) ----
+app.get("/api/users", requireAdmin(), (req, res) => {
+  try {
+    const users = readUsers(USERS_FILE).map(u => ({ username: u.username, role: u.role, createdAt: u.createdAt }));
+    res.json({ users });
+  } catch (e) {
+    console.error("list users error", e);
+    res.status(500).json({ error: "users_error" });
+  }
+});
+
+// ---- Users summary (all authenticated users) ----
+// Returns only aggregate counts (no credentials, no usernames). This is safe to show to USER role on dashboards.
+app.get("/api/users/summary", (req, res) => {
+  try {
+    const users = readUsers(USERS_FILE);
+    const byRole = {};
+    for (const u of users) {
+      const r = String(u?.role || "user").toLowerCase();
+      byRole[r] = (byRole[r] || 0) + 1;
+    }
+    res.json({ total: users.length, byRole });
+  } catch (e) {
+    console.error("users summary error", e);
+    res.status(500).json({ error: "users_summary_error" });
+  }
+});
+
+app.post("/api/users", requireAdmin(), (req, res) => {
+  const { username, password, role } = req.body || {};
+  const uname = String(username || "").trim();
+  if (!uname || !password) return res.status(400).json({ error: "missing_fields" });
+  if (uname.toLowerCase() === "admin") return res.status(400).json({ error: "reserved_username" });
+  const r = String(role || "user");
+  try {
+    const users = readUsers(USERS_FILE);
+    if (findUser(users, uname)) return res.status(409).json({ error: "user_exists" });
+    const { salt, hash } = hashPassword(password);
+    users.push({ username: uname, role: r, salt, hash, createdAt: new Date().toISOString() });
+    writeUsers(USERS_FILE, users);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("add user error", e);
+    res.status(500).json({ error: "users_error" });
+  }
+});
+
+app.put("/api/users/:username", requireAdmin(), (req, res) => {
+  const target = String(req.params.username || "").trim();
+  const { password, role } = req.body || {};
+  try {
+    const users = readUsers(USERS_FILE);
+    const u = findUser(users, target);
+    if (!u) return res.status(404).json({ error: "not_found" });
+    if (password) {
+      const { salt, hash } = hashPassword(password);
+      u.salt = salt; u.hash = hash;
+    }
+    if (role) u.role = String(role);
+    writeUsers(USERS_FILE, users);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("update user error", e);
+    res.status(500).json({ error: "users_error" });
+  }
+});
+
+app.delete("/api/users/:username", requireAdmin(), (req, res) => {
+  const target = String(req.params.username || "").trim();
+  if (target.toLowerCase() === "admin") return res.status(400).json({ error: "cannot_delete_admin" });
+  try {
+    const users = readUsers(USERS_FILE);
+    const next = users.filter(u => String(u.username).toLowerCase() !== target.toLowerCase());
+    if (next.length === users.length) return res.status(404).json({ error: "not_found" });
+    writeUsers(USERS_FILE, next);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete user error", e);
+    res.status(500).json({ error: "users_error" });
+  }
+});
+
+// ---- Tenant management (admin only; persisted to /data/tenants.json) ----
+app.get("/api/tenants", requireAdmin(), (_req, res) => {
+  try {
+    refreshTenants();
+    const list = Object.entries(TENANTS).map(([id, t]) => redactTenantForUi(id, t));
+    return res.json({ tenants: list });
+  } catch (e) {
+    console.error("list tenants error", e);
+    return res.status(500).json({ error: "tenants_error" });
+  }
+});
+
+app.post("/api/tenants", requireAdmin(), (req, res) => {
+  const id = String(req.body?.id || "").trim();
+  const tenant = req.body?.tenant || {};
+  if (!id) return res.status(400).json({ error: "missing_id" });
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) return res.status(400).json({ error: "bad_id", detail: "Use only letters, digits, _ or -" });
+  try {
+    refreshTenants();
+    if (TENANTS[id]) return res.status(409).json({ error: "tenant_exists" });
+    const next = { ...TENANTS, [id]: {
+      baseUrl: String(tenant.baseUrl || "").trim(),
+      apiKey: String(tenant.apiKey || "").trim(),
+      user: String(tenant.user || "").trim(),
+      password: String(tenant.password || "").trim(),
+      defaultSite: String(tenant.defaultSite || "").trim(),
+    }};
+    writeTenantsFile(next);
+    TENANTS = next;
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("create tenant error", e);
+    return res.status(500).json({ error: "tenants_error" });
+  }
+});
+
+app.put("/api/tenants/:id", requireAdmin(), (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const patch = req.body?.tenant || {};
+  try {
+    refreshTenants();
+    const cur = TENANTS[id];
+    if (!cur) return res.status(404).json({ error: "not_found" });
+    // For secrets, empty string means "keep existing".
+    const apiKey = String(patch.apiKey ?? "").trim();
+    const password = String(patch.password ?? "").trim();
+    const nextTenant = {
+      ...cur,
+      ...(patch.baseUrl !== undefined ? { baseUrl: String(patch.baseUrl || "").trim() } : {}),
+      ...(patch.user !== undefined ? { user: String(patch.user || "").trim() } : {}),
+      ...(patch.defaultSite !== undefined ? { defaultSite: String(patch.defaultSite || "").trim() } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      ...(password ? { password } : {}),
+    };
+    const next = { ...TENANTS, [id]: nextTenant };
+    writeTenantsFile(next);
+    TENANTS = next;
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("update tenant error", e);
+    return res.status(500).json({ error: "tenants_error" });
+  }
+});
+
+app.delete("/api/tenants/:id", requireAdmin(), (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || id === "default") return res.status(400).json({ error: "cannot_delete_default" });
+  try {
+    refreshTenants();
+    if (!TENANTS[id]) return res.status(404).json({ error: "not_found" });
+    const next = { ...TENANTS };
+    delete next[id];
+    writeTenantsFile(next);
+    TENANTS = next;
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("delete tenant error", e);
+    return res.status(500).json({ error: "tenants_error" });
+  }
+});
+
+
+// -------------------- inbound request logging (into in-memory LOGS for the UI) --------------------
+// Note: morgan logs to stdout; this middleware records /api/*, /mcp/* and /healthz in the UI log buffer.
+app.use((req, res, next) => {
+  const start = Date.now();
+  let resBytes = 0;
+
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+
+  res.write = (chunk, encoding, cb) => {
+    try {
+      if (chunk) resBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk), encoding || "utf-8");
+    } catch {}
+    return origWrite(chunk, encoding, cb);
+  };
+  res.end = (chunk, encoding, cb) => {
+    try {
+      if (chunk) resBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk), encoding || "utf-8");
+    } catch {}
+    return origEnd(chunk, encoding, cb);
+  };
+
+  res.on("finish", () => {
+    try {
+      const url = req.originalUrl || req.url || "";
+      if (!(url.startsWith("/api/") || url.startsWith("/mcp/") || url === "/healthz")) return;
+
+      const pathOnly = String(url).split("?")[0];
+      const routeKey = `${req.method} ${pathOnly}`;
+      const ms = Date.now() - start;
+
+      const tenant =
+        (req.query && req.query.tenant) ||
+        (req.body && (req.body.tenantId || req.body.tenant)) ||
+        req.headers["x-tenant"] ||
+        "default";
+
+      let reqBody = "";
+      if (HTTP_TRACE_ENABLED && req.body && Object.keys(req.body).length) {
+        reqBody = clip(redactSecrets(req.body));
+      }
+      const reqBytes = reqBody ? Buffer.byteLength(reqBody) : 0;
+
+      pushLog({
+        kind: "http_in",
+        title: `${res.statusCode} ${routeKey}`,
+        tenant: String(tenant),
+        status: res.statusCode,
+        url,
+        routeKey,
+        ms,
+        requestBytes: reqBytes,
+        responseBytes: resBytes,
+        reqTokensApprox: reqBytes ? Math.round(reqBytes / 4) : 0,
+        resTokensApprox: resBytes ? Math.round(resBytes / 4) : 0,
+        requestBody: reqBody,
+      });
+    } catch {}
+  });
+
+  next();
+});
+
+
+const PORT = process.env.PORT || 8081;
+const LOG_LIMIT = Number(process.env.LOG_LIMIT || 2000);
+
+// -------------------- SETTINGS (NEW) --------------------
+const SETTINGS_PATH = path.join(DATA_DIR, "mcp_settings.json");
+const CONCEPTS_OVERRIDES_DIR = path.join(DATA_DIR, "concepts");
+
+// Ensure data dirs exist (best-effort)
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(CONCEPTS_OVERRIDES_DIR, { recursive: true }); } catch {}
+
+function readMcpSettings() {
+  try {
+    if (!fs.existsSync(SETTINGS_PATH)) return {};
+    return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function writeMcpSettings(obj) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(obj, null, 2), "utf-8");
+  } catch {
+    // best-effort persistence
+  }
+}
+
+// -------------------- CONCEPT OVERRIDES (TENANT-AWARE) --------------------
+// Stored as /data/concepts/<tenantId>.json (editable via MCP UI).
+// This lets admins add their own entity phrases / quick phrases without
+// modifying shipped defaults.
+
+function conceptsOverridesPath(tenantId) {
+  const safe = String(tenantId || "default").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(CONCEPTS_OVERRIDES_DIR, `${safe}.json`);
+}
+
+function readConceptOverrides(tenantId) {
+  try {
+    const p = conceptsOverridesPath(tenantId);
+    if (!fs.existsSync(p)) return {};
+    return JSON.parse(fs.readFileSync(p, "utf-8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeConceptOverrides(tenantId, obj) {
+  try {
+    fs.mkdirSync(CONCEPTS_OVERRIDES_DIR, { recursive: true });
+    fs.writeFileSync(conceptsOverridesPath(tenantId), JSON.stringify(obj || {}, null, 2), "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// -------------------- SAVED TOOLS (NEW) --------------------
+// Admin-defined Maximo OS query presets, persisted per-tenant.
+// Stored under DATA_DIR as: mcp_tools_<tenant>.json
+
+function toolsPathForTenant(tenantId) {
+  const safe = String(tenantId || "default").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(DATA_DIR, `mcp_tools_${safe}.json`);
+}
+
+function readSavedTools(tenantId) {
+  try {
+    const p = toolsPathForTenant(tenantId);
+    if (!fs.existsSync(p)) return [];
+    const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+    return Array.isArray(j?.tools) ? j.tools : Array.isArray(j) ? j : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSavedTools(tenantId, tools) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const p = toolsPathForTenant(tenantId);
+    fs.writeFileSync(p, JSON.stringify({ tools: tools || [] }, null, 2), "utf-8");
+  } catch {
+    // best-effort
+  }
+}
+
+function normalizeSavedTool(tool) {
+  const t = tool || {};
+  const name = String(t.name || "").trim();
+  if (!name) throw new Error("tool.name required");
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error("tool.name must match [a-zA-Z0-9._-]+");
+
+  const os = String(t.os || "").trim();
+  if (!os) throw new Error("tool.os required");
+
+  const select = String(t.select || "").trim();
+  const where = String(t.where || "").trim();
+  const orderBy = String(t.orderBy || "").trim();
+  const pageSize = t.pageSize === undefined || t.pageSize === null ? "" : String(t.pageSize);
+  const lean = typeof t.lean === "boolean" ? t.lean : (String(t.lean || "").toLowerCase() === "true" ? true : (String(t.lean || "").toLowerCase() === "false" ? false : undefined));
+  const enabled = typeof t.enabled === "boolean" ? t.enabled : true;
+
+  return {
+    name,
+    title: String(t.title || "").trim() || name,
+    description: String(t.description || "").trim() || `Saved Maximo query preset (${os}).`,
+    enabled,
+    os,
+    select,
+    where,
+    orderBy,
+    pageSize,
+    lean,
+  };
+}
+
+function upsertSavedTool(tenantId, tool) {
+  const nt = normalizeSavedTool(tool);
+  const all = readSavedTools(tenantId);
+  const idx = all.findIndex((x) => String(x?.name || "") === nt.name);
+  if (idx >= 0) all[idx] = { ...all[idx], ...nt };
+  else all.push(nt);
+  writeSavedTools(tenantId, all);
+  return nt;
+}
+
+function deleteSavedTool(tenantId, name) {
+  const all = readSavedTools(tenantId);
+  const next = all.filter((x) => String(x?.name || "") !== String(name || ""));
+  writeSavedTools(tenantId, next);
+  return all.length !== next.length;
+}
+
+// Default ON (as you requested). Can be overridden by env or persisted settings.
+const persisted = readMcpSettings();
+let HTTP_TRACE_ENABLED =
+  (process.env.HTTP_TRACE_ENABLED === "0" || process.env.HTTP_TRACE_ENABLED === "false")
+    ? false
+    : (process.env.HTTP_TRACE_ENABLED === "1" || process.env.HTTP_TRACE_ENABLED === "true")
+      ? true
+      : (typeof persisted.httpTraceEnabled === "boolean")
+        ? persisted.httpTraceEnabled
+        : true;
+
+// ✅ NEW: Redaction policy (safe default: disabled)
+// Stored in mcp_settings.json under { redaction: { enabled, mode, fields, regexes } }
+function getRedactionPolicy() {
+  const s = readMcpSettings();
+  const p = s?.redaction || {};
+  return {
+    enabled: typeof p.enabled === "boolean" ? p.enabled : false,
+    mode: (p.mode === "full" || p.mode === "logs-only") ? p.mode : "logs-only",
+    fields: Array.isArray(p.fields) ? p.fields.map(String) : [],
+    regexes: Array.isArray(p.regexes) ? p.regexes : [],
+  };
+}
+
+// ---------- helpers ----------
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+function nowIso() { return new Date().toISOString(); }
+function clip(val, max = 12000) {
+  const s = typeof val === "string" ? val : JSON.stringify(val);
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `…(clipped ${s.length - max} chars)`;
+}
+function redactSecrets(obj) {
+  try {
+    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
+    // very small, best-effort redaction for common secrets
+    return s
+      .replace(/("apikey"\s*:\s*")[^"]+(")/gi, '$1***$2')
+      .replace(/("authorization"\s*:\s*")[^"]+(")/gi, '$1***$2')
+      .replace(/("password"\s*:\s*")[^"]+(")/gi, '$1***$2')
+      .replace(/("token"\s*:\s*")[^"]+(")/gi, '$1***$2');
+  } catch {
+    return "";
+  }
+}
+
+function uuid() { return crypto.randomBytes(12).toString("hex"); }
+function normalizeBaseUrl(u) {
+  let s = String(u || "").trim();
+  if (!s) return "";
+  s = s.replace(/\/+$/, "");
+  return s;
+}
+
+// Build an absolute origin for the current request, respecting common proxy headers.
+// Needed because Node's fetch() does NOT accept relative URLs.
+function requestOrigin(req) {
+  try {
+    const protoRaw = (req?.headers?.["x-forwarded-proto"] || req?.protocol || "http");
+    const proto = String(protoRaw).split(",")[0].trim() || "http";
+    const hostRaw = (req?.headers?.["x-forwarded-host"] || req?.get?.("host") || req?.headers?.host || "");
+    const host = String(hostRaw).split(",")[0].trim();
+    if (!host) return "";
+    return `${proto}://${host}`;
+  } catch {
+    return "";
+  }
+}
+
+function resolveAbsoluteBaseUrl(baseUrl, origin) {
+  let s = normalizeBaseUrl(baseUrl);
+  if (!s) return "";
+
+  // Already absolute
+  if (/^https?:\/\//i.test(s)) return s;
+
+  // Hostname without scheme -> assume https.
+  if (!s.startsWith("/") && /^[a-z0-9.-]+(?::\d+)?(\/.*)?$/i.test(s)) {
+    return `https://${s}`;
+  }
+
+  // Path-only (common when Maximo is reverse-proxied on the same host)
+  if (s.startsWith("/")) {
+    const o = String(origin || process.env.MAXIMO_ORIGIN || process.env.PUBLIC_ORIGIN || "").trim().replace(/\/+$/, "");
+    if (!o) return s; // last resort; callers may throw
+    return o + s;
+  }
+
+  return s;
+}
+function normalizeOrderBy(orderBy) {
+  // MAS Manage OSLC expects each sort key to start with + or -
+  // Examples: "+assetnum", "-changedate,+assetnum", "assetnum asc".
+  const s = String(orderBy || "").trim();
+  if (!s) return "";
+
+  return s
+    .split(",")
+    .map((tok) => String(tok || "").trim())
+    .filter(Boolean)
+    .map((tok) => {
+      const m = tok.match(/^([a-zA-Z0-9_:\-]+)\s+(asc|desc)$/i);
+      if (m) return (m[2].toLowerCase() === "desc" ? "-" : "+") + m[1];
+      if (/^[+-]/.test(tok)) return tok;
+      // Default to ascending if no explicit sign is provided
+      return "+" + tok;
+    })
+    .join(",");
+}
+
+// Like normalizeOrderBy, but also sanitizes identifiers for a given OS.
+// This prevents common Maximo errors like:
+// - BMXAA9105E "Invalid OSLC order by identifier SRNUM specified" (case/prefix issues)
+// - BMXAA9105E "Invalid OSLC order by identifier wo specified" (relationship/prefix issues)
+function normalizeOrderByForOs(os, orderBy) {
+  const s = String(orderBy || "").trim();
+  if (!s) return "";
+
+  return s
+    .split(",")
+    .map((tok) => String(tok || "").trim())
+    .filter(Boolean)
+    .map((tok) => {
+      // Support "field asc|desc" syntax
+      const m = tok.match(/^([a-zA-Z0-9_:\-.]+)\s+(asc|desc)$/i);
+      if (m) tok = (m[2].toLowerCase() === "desc" ? "-" : "+") + m[1];
+
+      let sign = "+";
+      let field = tok;
+      if (/^[+-]/.test(tok)) {
+        sign = tok[0];
+        field = tok.slice(1);
+      }
+
+      field = sanitizeSelectColumn(os, field);
+      // Some Maximo resource definitions are case-sensitive and tend to use lower-case identifiers.
+      if (/^[A-Z0-9_]+$/.test(field)) field = field.toLowerCase();
+      if (!field) return "";
+      return sign + field;
+    })
+    .filter(Boolean)
+    .join(",");
+}
+
+// --- Schema-aware OSLC sanitization (generic for any OS) ---
+function buildLowerFieldIndex(fieldsSet) {
+  const idx = new Map();
+  if (!fieldsSet || fieldsSet.size === 0) return idx;
+  for (const f of fieldsSet) {
+    const k = String(f || "").trim();
+    if (!k) continue;
+    idx.set(k.toLowerCase(), k);
+  }
+  return idx;
+}
+
+function normalizeToExistingField(field, fieldsIdx) {
+  const f = String(field || "").trim();
+  if (!f) return "";
+  if (!fieldsIdx || fieldsIdx.size === 0) return f;
+  return fieldsIdx.get(f.toLowerCase()) || "";
+}
+
+function chooseFallbackOrderBy(fieldsIdx) {
+  if (!fieldsIdx || fieldsIdx.size === 0) return "";
+  const prefers = [
+    "changedate",
+    "statusdate",
+    "reportdate",
+    "createdate",
+    "startdate",
+    "enddate",
+    "ticketid",
+    "wonum",
+    "id",
+  ];
+  for (const p of prefers) {
+    const hit = fieldsIdx.get(p);
+    if (hit) return "-" + hit;
+  }
+  // otherwise, prefer any field that ends with "date"
+  for (const [k, v] of fieldsIdx.entries()) {
+    if (k.endsWith("date")) return "-" + v;
+  }
+  // or any field that ends with "id"
+  for (const [k, v] of fieldsIdx.entries()) {
+    if (k.endsWith("id")) return "-" + v;
+  }
+  return "";
+}
+
+function sanitizeSelectWithSchema(os, selectStr, fieldsIdx) {
+  const sel = String(selectStr || "").trim();
+  if (!sel) return sel;
+  if (!fieldsIdx || fieldsIdx.size === 0) return sel;
+
+  const cols = parseSelectColumns(sel)
+    .map((c) => sanitizeSelectColumn(os, c))
+    .filter(Boolean);
+
+  const out = [];
+  for (const c of cols) {
+    // Dot-path selectors should NOT be sent to Maximo in oslc.select.
+    // If we see a dot-path like "asset.assettype", convert it to nested brace syntax: asset{assettype}.
+    // This keeps OSLC syntax valid while allowing the UI to flatten values client-side.
+    if (c.includes(".")) {
+      const [relRaw, fieldRaw] = c.split(".", 2);
+      const rel = String(relRaw || "").trim();
+      const field = String(fieldRaw || "").trim();
+      if (rel && field) {
+        out.push(`${rel}{${field}}`);
+      }
+      continue;
+    }
+    const hit = normalizeToExistingField(c, fieldsIdx);
+    if (hit) out.push(hit);
+  }
+
+  return out.length ? out.join(",") : sel;
+}
+
+function sanitizeOrderByWithSchema(os, orderByStr, fieldsIdx) {
+  const raw = String(orderByStr || "").trim();
+  if (!raw) return { orderBy: "", dropped: [] };
+  const normalized = normalizeOrderByForOs(os, raw);
+  if (!fieldsIdx || fieldsIdx.size === 0) return { orderBy: normalized, dropped: [] };
+
+  const dropped = [];
+  const toks = normalized
+    .split(",")
+    .map((t) => String(t || "").trim())
+    .filter(Boolean);
+
+  const out = [];
+  for (const t of toks) {
+    const sign = (t[0] === "-" ? "-" : "+");
+    const field = (t[0] === "+" || t[0] === "-" ? t.slice(1) : t);
+    // OSLC orderBy does not support dot-path ordering in Manage.
+    if (!field || field.includes(".")) {
+      dropped.push(t);
+      continue;
+    }
+    const hit = normalizeToExistingField(field, fieldsIdx);
+    if (!hit) {
+      dropped.push(t);
+      continue;
+    }
+    out.push(sign + hit);
+  }
+
+  if (out.length) return { orderBy: out.join(","), dropped };
+  const fb = chooseFallbackOrderBy(fieldsIdx);
+  return { orderBy: fb, dropped: dropped.length ? dropped : toks };
+}
+
+function sanitizeWhereWithSchema(os, whereStr, fieldsIdx) {
+  let w = String(whereStr || "").trim();
+  if (!w) return { where: w, dropped: [] };
+  // Keep existing normalization behavior (quotes/spacing)
+  w = normalizeOslcWhere(w);
+
+  if (!fieldsIdx || fieldsIdx.size === 0) return { where: w, dropped: [] };
+
+  const dropped = [];
+  const parts = w.split(/\s+and\s+/i).map((x) => String(x || "").trim()).filter(Boolean);
+  const kept = [];
+  for (const p of parts) {
+    // Try to capture "field<op>..." where <op> is a comparison operator.
+    const m = p.match(/^([A-Za-z0-9_:\-.]+)\s*(=|!=|>=|<=|>|<)\s*(.+)$/);
+    if (!m) {
+      // unknown clause shape; keep it rather than guessing
+      kept.push(p);
+      continue;
+    }
+    let field = sanitizeSelectColumn(os, m[1]);
+    // If the field still contains dot-path, we can't validate safely; keep it.
+    if (!field || field.includes(".")) {
+      kept.push(p);
+      continue;
+    }
+    const hit = normalizeToExistingField(field, fieldsIdx);
+    if (!hit) {
+      dropped.push(p);
+      continue;
+    }
+    const op = m[2];
+    const rhs = String(m[3] || "").trim();
+    kept.push(`${hit}${op}${rhs}`);
+  }
+  return { where: kept.join(" and "), dropped };
+}
+
+function sanitizeSelectColumn(os, col) {
+  let c = String(col || "").trim();
+  if (!c) return "";
+
+  // Drop SQL-ish aliases: "field as alias"
+  c = c.replace(/\s+as\s+[A-Za-z_][A-Za-z0-9_]*$/i, "").trim();
+
+  // Many LLMs return relationship-qualified fields like "wo.wonumber".
+  // For OSLC select, relationship prefixes must correspond to real Maxrelationship entries.
+  // For mxapiwo itself, "wo" is not a relationship — it's the base object.
+  const osKey = String(os || "").trim().toLowerCase();
+  if (osKey === "mxapiwo") {
+    c = c.replace(/^wo\./i, "");
+    c = c.replace(/^workorder\./i, "");
+  }
+  if (osKey === "mxapisr") {
+    c = c.replace(/^sr\./i, "");
+  }
+
+  // Common field synonyms from older examples
+  if (osKey === "mxapiwo") {
+    if (/^wonumber$/i.test(c)) c = "wonum";
+  }
+
+  return c;
+}
+
+
+/**
+ * Parse an OSLC select string (comma-separated) into a list of column selectors.
+ * Keeps order, removes empties, and strips common OSLC nested syntax (e.g. asset{assetnum} -> asset).
+ *
+ * IMPORTANT: Do NOT strip dot-paths (e.g. item.description, invbalances.curbal).
+ * Those are valid selectors in MAS Manage OSLC and must survive end-to-end so we can
+ * project them into tabular rows.
+ */
+function parseSelectColumns(selectStr) {
+  // Split an OSLC select string into top-level selectors.
+  // IMPORTANT: Do NOT expand nested brace syntax into dot paths here.
+  // Maximo OSLC select supports nested selectors like: asset{assetnum,assettype}
+  // but does NOT reliably accept dot-path selectors in oslc.select across endpoints.
+  const s = String(selectStr || "").trim();
+  if (!s) return [];
+  const out = [];
+  let cur = "";
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "{") depth++;
+    if (ch === "}") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) {
+      const tok = cur.trim();
+      if (tok) out.push(tok);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  const tok = cur.trim();
+  if (tok) out.push(tok);
+  return out;
+}
+
+
+function getByPath(obj, pathStr) {
+  if (!obj || typeof obj !== "object") return "";
+  const raw = String(pathStr || "").trim();
+  if (!raw) return "";
+
+  const parts = raw.split(".").map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) return "";
+
+  const step = (cur, idx) => {
+    if (cur === null || cur === undefined) return undefined;
+    if (idx >= parts.length) return cur;
+
+    const key = parts[idx];
+
+    if (Array.isArray(cur)) {
+      const vals = cur
+        .map((el) => step(el, idx))
+        .filter((v) => v !== undefined && v !== null && String(v).trim() !== "");
+      if (!vals.length) return undefined;
+      if (vals.length === 1) return vals[0];
+      return vals.map(String).join("|");
+    }
+
+    if (typeof cur !== "object") return undefined;
+
+    // Case-insensitive key lookup
+    const map = new Map(Object.keys(cur).map((k) => [String(k).toLowerCase(), k]));
+    const actual = map.get(String(key).toLowerCase());
+    if (!actual) return undefined;
+    return step(cur[actual], idx + 1);
+  };
+
+  const v = step(obj, 0);
+  if (v === undefined || v === null) return "";
+  // Keep primitives as-is; stringify objects/arrays defensively.
+  if (typeof v === "object") {
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return v;
+}
+
+/**
+ * Project a Maximo OSLC JSON response down to only the selected columns.
+ * Returns a stable, LLM-friendly tabular payload: { os, columns, rows, totalCount? }.
+ */
+function projectOslcResponseToTable(os, body, columns, opts = {}) {
+  const cols = Array.isArray(columns) ? columns.filter(Boolean) : [];
+  const members = Array.isArray(body?.member)
+    ? body.member
+    : Array.isArray(body?.["rdfs:member"])
+      ? body["rdfs:member"]
+      : [];
+
+  // If members are rdf:resource-only, we can't project; return a lightweight list of hrefs.
+  const isRdfResourceList =
+    members.length > 0 &&
+    typeof members[0] === "object" &&
+    members[0] !== null &&
+    !Array.isArray(members[0]) &&
+    Object.keys(members[0]).length === 1 &&
+    (members[0]["rdf:resource"] || members[0].href);
+
+  if (isRdfResourceList) {
+    const hrefs = members
+      .map((m) => m["rdf:resource"] || m.href)
+      .filter(Boolean);
+    const returnedCount = hrefs.length;
+    const pageSize = typeof opts.pageSize === "number" && Number.isFinite(opts.pageSize) && opts.pageSize > 0 ? opts.pageSize : returnedCount;
+    const page = typeof opts.page === "number" && Number.isFinite(opts.page) && opts.page > 0 ? opts.page : 1;
+    const hasMore = returnedCount === pageSize;
+    const nextPage = hasMore ? page + 1 : null;
+
+    return {
+      os,
+      renderHint: "grid",
+      table: { columns: ["href"], rows: hrefs.map((h) => ({ href: h })) },
+      columns: ["href"],
+      rows: hrefs.map((h) => ({ href: h })),
+      returnedCount,
+      pageSize,
+      page,
+      hasMore,
+      nextPage,
+      totalCount: hrefs.length,
+    };
+  }
+
+  const rows = members.map((m) => {
+    const row = {};
+    for (const c of cols) {
+      // include key even if missing for stable tabular rendering
+      row[c] = getByPath(m, c);
+    }
+    return row;
+  });
+
+  // Try to infer totalCount if present
+  const totalCount =
+    body?.["oslc:responseInfo"]?.["oslc:totalCount"] ??
+    body?.responseInfo?.totalCount ??
+    body?.totalCount ??
+    (Array.isArray(members) ? members.length : undefined);
+
+  const returnedCount = rows.length;
+  const pageSize = typeof opts.pageSize === "number" && Number.isFinite(opts.pageSize) && opts.pageSize > 0 ? opts.pageSize : returnedCount;
+  const page = typeof opts.page === "number" && Number.isFinite(opts.page) && opts.page > 0 ? opts.page : 1;
+  const hasMore = typeof totalCount !== "undefined" ? (page * pageSize < Number(totalCount)) : (returnedCount === pageSize);
+  const nextPage = hasMore ? page + 1 : null;
+
+  return {
+    os,
+    renderHint: "grid",
+    table: { columns: cols, rows },
+    columns: cols,
+    rows,
+    returnedCount,
+    pageSize,
+    page,
+    hasMore,
+    nextPage,
+    ...(typeof totalCount !== "undefined" ? { totalCount } : {}),
+  };
+}
+
+// ---------- OSLC helpers (paging / parsing) ----------
+function getOslcMembers(body) {
+  if (!body || typeof body !== "object") return [];
+  if (Array.isArray(body.member)) return body.member;
+  if (Array.isArray(body["rdfs:member"])) return body["rdfs:member"];
+  return [];
+}
+
+function setOslcMembers(body, members) {
+  if (!body || typeof body !== "object") return body;
+  const out = { ...body };
+  if (Array.isArray(body.member)) out.member = members;
+  if (Array.isArray(body["rdfs:member"])) out["rdfs:member"] = members;
+  // If neither was present, default to `member`.
+  if (!Array.isArray(body.member) && !Array.isArray(body["rdfs:member"])) out.member = members;
+  return out;
+}
+
+function getOslcTotalCount(body) {
+  if (!body || typeof body !== "object") return undefined;
+  return (
+    body?.["oslc:responseInfo"]?.["oslc:totalCount"] ??
+    body?.responseInfo?.totalCount ??
+    body?.totalCount
+  );
+}
+
+function getOslcNextPageHref(body) {
+  if (!body || typeof body !== "object") return "";
+  const np = body?.["oslc:responseInfo"]?.["oslc:nextPage"] ?? body?.responseInfo?.nextPage ?? body?.nextPage;
+  if (!np) return "";
+  if (typeof np === "string") return np;
+  if (typeof np === "object") return np["rdf:resource"] || np.href || "";
+  return "";
+}
+
+// Build a stable unique key for OSLC members to guard against accidental duplication
+// when paging without a deterministic order (or when Manage returns overlapping pages).
+function oslcMemberKey(os, m) {
+  if (!m || typeof m !== "object") return "";
+  // Prefer href when present – it's globally unique for a record.
+  const href = typeof m.href === "string" ? m.href : (typeof m["rdf:about"] === "string" ? m["rdf:about"] : "");
+  if (href) return href;
+
+  const osKey = String(os || "").trim().toLowerCase();
+  const siteid = (m.siteid ?? m.SITEID ?? "");
+  const orgid = (m.orgid ?? m.ORGID ?? "");
+  const assetnum = (m.assetnum ?? m.ASSETNUM ?? "");
+  const wonum = (m.wonum ?? m.WONUM ?? "");
+  const pmnum = (m.pmnum ?? m.PMNUM ?? "");
+  const jpnum = (m.jpnum ?? m.JPNUM ?? "");
+
+  if (osKey === "mxapiwo" && wonum) return `${siteid}|${wonum}`;
+  if (osKey === "mxapiasset" && assetnum) return `${siteid}|${assetnum}`;
+  if (osKey === "mxapipm" && pmnum) return `${siteid}|${pmnum}`;
+  if (osKey === "mxapijobplan" && jpnum) return `${orgid}|${jpnum}`;
+
+  // Fallback: rowstamp is often unique within a dataset.
+  const rs = (m._rowstamp ?? m["_rowstamp"] ?? "");
+  if (rs) return `${osKey}|${rs}`;
+  return "";
+}
+
+function dedupeOslcMembers(os, members) {
+  if (!Array.isArray(members) || members.length === 0) return members || [];
+  const seen = new Set();
+  const out = [];
+  for (const m of members) {
+    const k = oslcMemberKey(os, m);
+    if (k) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+// ---------- in-memory logs ----------
+const LOGS = [];
+function pushLog(evt) {
+  // NEW: When trace OFF, keep meta logs but avoid large bodies/headers
+  const sanitized = { ...evt };
+
+  if (!HTTP_TRACE_ENABLED) {
+    delete sanitized.requestHeaders;
+    delete sanitized.responseHeaders;
+    delete sanitized.requestBody;
+    delete sanitized.responseBody;
+    // keep a short marker if desired
+    if (evt?.requestBody) sanitized.requestBody = "[httpTrace disabled]";
+    if (evt?.responseBody) sanitized.responseBody = "[httpTrace disabled]";
+  }
+
+  const e = {
+    id: uuid(),
+    ts: Date.now(),
+    iso: nowIso(),
+    ...sanitized,
+  };
+
+  LOGS.push(e);
+  if (LOGS.length > LOG_LIMIT) LOGS.splice(0, LOGS.length - LOG_LIMIT);
+  return e.id;
+}
+
+// ---------- tenant config (persistent) ----------
+function parseTenantsFromEnv() {
+  try {
+    if (process.env.TENANTS_JSON) return JSON.parse(process.env.TENANTS_JSON);
+  } catch {}
+  const baseUrl = process.env.MAXIMO_URL;
+  const apiKey = process.env.MAXIMO_APIKEY;
+  return {
+    default: { baseUrl, apiKey, user: process.env.MAXIMO_USER, password: process.env.MAXIMO_PASSWORD, defaultSite: process.env.MAXIMO_SITE || process.env.DEFAULT_SITE || "" },
+  };
+}
+
+function readTenantsFile() {
+  // Prefer the requested filename (tenant.json), but keep backward compatibility
+  // with older deployments that used tenants.json.
+  const candidates = [TENANTS_FILE_PRIMARY, TENANTS_FILE_LEGACY];
+
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      // Allow either { tenants: {...} } or a direct map.
+      if (j && typeof j === "object" && j.tenants && typeof j.tenants === "object") return j.tenants;
+      if (j && typeof j === "object") return j;
+    } catch {
+      // Try next candidate
+    }
+  }
+  return null;
+}
+
+function writeTenantsFile(tenants) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    // Primary write location (requested)
+    fs.writeFileSync(TENANTS_FILE_PRIMARY, JSON.stringify({ tenants }, null, 2), "utf-8");
+
+    // Best-effort: also keep the legacy filename in sync so older docs/scripts
+    // (or previously deployed versions) keep working.
+    try {
+      fs.writeFileSync(TENANTS_FILE_LEGACY, JSON.stringify({ tenants }, null, 2), "utf-8");
+    } catch {
+      // ignore
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function maskSecret(v) {
+  const s = String(v || "");
+  if (!s) return "";
+  if (s.length <= 6) return "••••";
+  return `${s.slice(0, 2)}••••${s.slice(-2)}`;
+}
+
+function redactTenantForUi(id, t) {
+  const baseUrl = String(t?.baseUrl || "");
+  return {
+    id,
+    baseUrl,
+    defaultSite: String(t?.defaultSite || ""),
+    apiKey: t?.apiKey ? maskSecret(t.apiKey) : "",
+    user: String(t?.user || ""),
+    password: t?.password ? "••••" : "",
+    hasApiKey: !!t?.apiKey,
+    hasPassword: !!t?.password,
+  };
+}
+
+function loadTenants() {
+  const env = parseTenantsFromEnv() || {};
+  const file = readTenantsFile() || {};
+  // File tenants override env (so UI edits persist).
+  return { ...env, ...file };
+}
+
+let TENANTS = loadTenants();
+
+function refreshTenants() {
+  TENANTS = loadTenants();
+  return TENANTS;
+}
+
+function tenantOrThrow(tenantId, origin = "") {
+  const id = String(tenantId || "default");
+  const t = TENANTS[id];
+  if (!t) throw new Error(`Tenant is not configured: ${id}`);
+  const baseUrl = resolveAbsoluteBaseUrl(t.baseUrl, origin);
+  if (!baseUrl || baseUrl.startsWith("/")) {
+    throw new Error(
+      `Tenant ${id} baseUrl is not absolute: ${String(t.baseUrl || "")} (resolved: ${baseUrl}). ` +
+      `Set a full URL (e.g. https://your-host/maximo) or set MAXIMO_ORIGIN/PUBLIC_ORIGIN to prefix path-only values.`
+    );
+  }
+  // Validate URL early so callers get a useful error instead of a generic "Invalid URL".
+  try {
+    // eslint-disable-next-line no-new
+    new URL(baseUrl);
+  } catch (e) {
+    throw new Error(
+      `Tenant ${id} baseUrl is not a valid URL: ${String(t.baseUrl || "")} (resolved: ${baseUrl}). ` +
+      `Original error: ${String(e?.message || e)}`
+    );
+  }
+  return { tenantId: id, ...t, baseUrl };
+}
+
+function authHeaders(t) {
+  const headers = { accept: "application/json" };
+  if (t.apiKey) headers["apikey"] = t.apiKey;
+  return headers;
+}
+
+// Best-effort extraction of a readable Maximo error message.
+// Maximo error envelopes vary by version / config.
+function extractMaximoErrorMessage(bodyRaw, fallbackText = "") {
+  try {
+    if (!bodyRaw || typeof bodyRaw !== "object") return String(fallbackText || "").trim();
+
+    // Common patterns we've seen in Maximo REST API:
+    // 1) { Error: { message, statusCode, ... } }
+    // 2) { error: { message, ... } }
+    // 3) { message: "..." }
+    const cand =
+      bodyRaw?.Error?.message ||
+      bodyRaw?.Error?.Message ||
+      bodyRaw?.error?.message ||
+      bodyRaw?.error_description ||
+      bodyRaw?.message ||
+      bodyRaw?.detail ||
+      bodyRaw?.error;
+
+    if (cand == null) return String(fallbackText || "").trim();
+    if (typeof cand === "string") return cand.trim();
+    try {
+      return JSON.stringify(cand);
+    } catch {
+      return String(fallbackText || "").trim();
+    }
+  } catch {
+    return String(fallbackText || "").trim();
+  }
+}
+
+function isLikelyOsNotFound(status, respText) {
+  if (status === 404) return true;
+  if (status !== 400) return false;
+  const s = String(respText || "");
+  // Maximo often returns 400 with an error message when an OS isn't defined.
+  // Examples include BMXAA errors, "object structure ... is not defined", etc.
+  return /(object\s+structure|os\s+name|mxapi|mxasset|BMXAA)/i.test(s) &&
+         /(not\s+found|not\s+defined|does\s+not\s+exist|is\s+not\s+defined|unknown)/i.test(s);
+}
+
+function isLikelyWhereClauseError(status, respText) {
+  if (status !== 400) return false;
+  const s = String(respText || "");
+  return /(oslc\.where|where\s+clause|query\s+syntax|invalid\s+query|BMXAA)/i.test(s) &&
+         /(invalid|syntax|parse|cannot|unable)/i.test(s);
+}
+
+function isLikelyInvalidOrderBy(status, respText) {
+  if (status !== 400) return false;
+  const s = String(respText || "");
+  // Example: BMXAA9105E - Invalid OSLC order by identifier changedate specified...
+  return /(Invalid\s+OSLC\s+order\s+by\s+identifier|BMXAA9105E)/i.test(s);
+}
+
+function maximoApiBase(tOrBase, req) {
+  // Build a stable *absolute* base for the Maximo REST API.
+  // Accepts either a tenant object { baseUrl, ... } or a raw baseUrl string.
+  // Handles values like:
+  // - https://host              -> https://host/maximo/api
+  // - https://host/maximo       -> https://host/maximo/api
+  // - https://host/maximo/api   -> https://host/maximo/api
+  // - /maximo                   -> <request-origin>/maximo/api
+  // Node's fetch() does NOT accept relative URLs; this ensures we never return a relative base.
+
+  const baseUrlRaw = (typeof tOrBase === "string") ? tOrBase : (tOrBase?.baseUrl || "");
+  const origin = req ? requestOrigin(req) : "";
+  const abs = resolveAbsoluteBaseUrl(baseUrlRaw, origin);
+  if (!/^https?:\/\//i.test(String(abs || ""))) {
+    // If we still don't have an absolute URL, fail fast with a clear message.
+    throw new Error(`Tenant baseUrl must be absolute (or a path with a resolvable origin). Got: ${String(baseUrlRaw || "")} (resolved: ${String(abs || "")})`);
+  }
+
+  const raw = normalizeBaseUrl(abs);
+  const u = new URL(raw);
+
+  // Normalize path
+  let p = u.pathname || "/";
+  p = p.replace(/\/+$/, "");
+  if (!p) p = "/";
+
+  if (p.endsWith("/maximo/api")) {
+    // already includes /maximo/api
+  } else if (p.endsWith("/maximo")) {
+    p = p + "/api";
+  } else if (p.endsWith("/api")) {
+    // already ends with /api (some deployments expose API at the root of a prefix)
+  } else {
+    p = p + "/maximo/api";
+  }
+
+  // Ensure we don't double-slash
+  p = p.replace(/\/+/, "/");
+  u.pathname = p;
+  u.search = "";
+  u.hash = "";
+  return u.toString().replace(/\/+$/, "");
+}
+
+// ---------- allowlist storage ----------
+function allowlistPath(tenantId) {
+  return path.join(DATA_DIR, `os_allowlist_${tenantId}.json`);
+}
+function readAllowlist(tenantId) {
+  try {
+    const p = allowlistPath(tenantId);
+    if (!fs.existsSync(p)) return null;
+    const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+    if (Array.isArray(j)) return j.map(String);
+    if (Array.isArray(j?.allowed)) return j.allowed.map(String);
+    return null;
+  } catch {
+    return null;
+  }
+}
+function writeAllowlist(tenantId, allowed) {
+  const arr = Array.from(
+    new Set((Array.isArray(allowed) ? allowed : []).map((x) => String(x).trim()).filter(Boolean))
+  ).sort();
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(allowlistPath(tenantId), JSON.stringify({ allowed: arr }, null, 2), "utf-8");
+  } catch {}
+  return arr;
+}
+function isAllowedOs(tenantId, os, allowlist) {
+  const list = allowlist ?? readAllowlist(tenantId);
+  if (!list || !list.length) return true;
+  return list.includes(os);
+}
+
+
+// ---------- enabled tools (per-tenant tool allowlist/denylist) ----------
+function enabledToolsPath(tenantId) {
+  return path.join(DATA_DIR, `enabled_tools_${tenantId}.json`);
+}
+function readEnabledTools(tenantId) {
+  try {
+    const p = enabledToolsPath(tenantId);
+    if (!fs.existsSync(p)) return null;
+    const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+    if (Array.isArray(j)) return j.map(String);
+    if (Array.isArray(j?.enabledTools)) return j.enabledTools.map(String);
+    if (Array.isArray(j?.enabled)) return j.enabled.map(String);
+    return null;
+  } catch {
+    return null;
+  }
+}
+function writeEnabledTools(tenantId, enabledTools) {
+  const arr = Array.from(
+    new Set((Array.isArray(enabledTools) ? enabledTools : []).map((x) => String(x).trim()).filter(Boolean))
+  ).sort();
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(enabledToolsPath(tenantId), JSON.stringify({ enabledTools: arr }, null, 2), "utf-8");
+  } catch {}
+  return arr;
+}
+function isToolEnabled(tenantId, toolName, enabledTools) {
+  const list = enabledTools ?? readEnabledTools(tenantId);
+  if (!list || !list.length) return true; // default: everything enabled
+  return list.includes(String(toolName || ""));
+}
+
+
+// ---------- OS discovery (best-effort) ----------
+async function fetchOsListBestEffort(t) {
+  const maximoBase = normalizeBaseUrl(t.baseUrl);
+  const candidates = [
+    `${maximoBase}/oslc/apimeta?lean=1`,
+    `${maximoBase}/api/oslc/apimeta?lean=1`,
+    `${maximoBase}/oslc/apimeta`,
+    `${maximoBase}/api/oslc/apimeta`,
+  ];
+  const headers = { ...authHeaders(t), accept: "application/json" };
+
+  let lastErr = null;
+  for (const url of candidates) {
+    try {
+      const r = await fetch(url, { headers, redirect: "follow" });
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const bodyText = await r.text();
+
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}: ${bodyText.slice(0, 240)}`);
+      if (ct.includes("text/html") || bodyText.trim().startsWith("<!DOCTYPE html"))
+        throw new Error(`Returned HTML (likely login/UI). URL=${url}`);
+
+      const j = safeJson(bodyText);
+      if (!j) throw new Error(`Returned non-JSON. URL=${url} ct=${ct || "unknown"}`);
+
+      const members = j.member || j["rdfs:member"] || j?.response?.member || j?.osList || [];
+      const names = (Array.isArray(members) ? members : [])
+        .map((m) => m?.name || m?.objectStructure || m?.osName || m?.os || m?.oslc_shortTitle)
+        .filter(Boolean)
+        .map((s) => String(s).trim())
+        .filter(Boolean);
+
+      return { names: Array.from(new Set(names)), raw: j };
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  throw lastErr || new Error("OS discovery failed");
+}
+
+// ---------- outgoing Maximo request wrapper ----------
+async function maximoFetch(t, { method, url, headers, body, kind, title, meta }) {
+  const start = Date.now();
+  const redaction = getRedactionPolicy();
+
+  // If mode=full, redact before the request goes out. Default is logs-only (safe).
+  let outgoingBody = body;
+  if (redaction.enabled && redaction.mode === "full" && body) {
+    const parsed = safeJson(String(body));
+    const { payload } = applyRedactionPolicy(parsed ?? String(body), redaction);
+    outgoingBody = typeof payload === "string" ? payload : JSON.stringify(payload);
+  }
+
+  const reqBytes = outgoingBody ? Buffer.byteLength(String(outgoingBody)) : 0;
+
+  const txId = pushLog({
+    kind: kind || "tx_maximo",
+    title: title || "→ Maximo",
+    method,
+    url,
+    tenant: t.tenantId,
+    requestHeaders: HTTP_TRACE_ENABLED
+      ? (headers ? { ...headers, apikey: headers.apikey ? "***" : undefined } : undefined)
+      : undefined,
+    requestBody: HTTP_TRACE_ENABLED
+      ? (() => {
+          if (!outgoingBody) return "";
+          // logs-only redaction applies even when request is not redacted
+          const src = safeJson(String(outgoingBody)) ?? String(outgoingBody);
+          const { payload } = applyRedactionPolicy(src, redaction);
+          return clip(typeof payload === "string" ? payload : JSON.stringify(payload));
+        })()
+      : "",
+    requestBytes: reqBytes,
+    reqTokensApprox: reqBytes ? Math.round(reqBytes / 4) : 0,
+    meta,
+  });
+
+  let r;
+  let respText = "";
+  try {
+    r = await fetch(url, { method, headers, body: outgoingBody });
+    respText = await r.text();
+  } catch (e) {
+    const ms = Date.now() - start;
+    pushLog({
+      kind: "rx_maximo",
+      title: "← Maximo (network error)",
+      tenant: t.tenantId,
+      status: 0,
+      url,
+      relatedId: txId,
+      ms,
+      responseBytes: 0,
+      resTokensApprox: 0,
+      responseHeaders: {},
+      responseBody: HTTP_TRACE_ENABLED ? clip(String(e?.message || e)) : "",
+      meta: { ...(meta || {}), error: String(e?.message || e) },
+    });
+    throw e;
+  }
+
+  const ms = Date.now() - start;
+  const resBytes = respText ? Buffer.byteLength(respText) : 0;
+
+  // logs-only redaction for response bodies
+  const redRes = (() => {
+    if (!respText) return "";
+    const src = safeJson(respText) ?? respText;
+    const { payload } = applyRedactionPolicy(src, redaction);
+    return typeof payload === "string" ? payload : JSON.stringify(payload);
+  })();
+
+  pushLog({
+    kind: "rx_maximo",
+    title: "← Maximo",
+    tenant: t.tenantId,
+    status: r.status,
+    url,
+    relatedId: txId,
+    ms,
+    responseBytes: resBytes,
+    resTokensApprox: resBytes ? Math.round(resBytes / 4) : 0,
+    responseHeaders: HTTP_TRACE_ENABLED ? { "content-type": r.headers.get("content-type") || "" } : undefined,
+    responseBody: HTTP_TRACE_ENABLED ? clip(redRes) : "",
+    meta,
+  });
+
+  return { r, respText, ms, reqBytes, resBytes };
+}
+
+// ---------- health ----------
+app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+// ---------- logs api ----------
+app.get("/api/logs", (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 200), 5000);
+  res.json({ logs: LOGS.slice(Math.max(0, LOGS.length - limit)) });
+});
+app.get("/api/logs/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  const hit = LOGS.find((x) => x.id === id);
+  if (!hit) return res.status(404).json({ error: "not_found" });
+  return res.json(hit);
+});
+// Clearing logs is an admin-only action.
+app.post("/api/logs/clear", requireAdmin(), (_req, res) => {
+  LOGS.splice(0, LOGS.length);
+  return res.json({ ok: true });
+});
+
+// ---------- settings api (UPDATED) ----------
+app.get("/api/settings", (_req, res) => {
+  refreshTenants();
+  res.json({
+    port: PORT,
+    logLimit: LOG_LIMIT,
+    dataDir: DATA_DIR,
+    tenants: Object.keys(TENANTS),
+    allowlistPersistence: "best-effort (/data)",
+    osDiscovery: "best-effort (apimeta; may be disabled by Maximo)",
+    httpTraceEnabled: HTTP_TRACE_ENABLED, // ✅ NEW
+    traceHttp: HTTP_TRACE_ENABLED, // ✅ legacy for unchanged UI
+  });
+});
+
+// ✅ NEW: toggle http trace (admin-only)
+app.put("/api/settings", requireAdmin(), (req, res) => {
+  const v = req.body?.httpTraceEnabled;
+  const legacy = req.body?.traceHttp;
+  const enabled = req.body?.enabled;
+
+  const next =
+    typeof v === "boolean" ? v :
+    typeof legacy === "boolean" ? legacy :
+    typeof enabled === "boolean" ? enabled :
+    null;
+
+  if (typeof next !== "boolean") {
+    return res.status(400).json({
+      error: "bad_request",
+      detail: "Body must include boolean httpTraceEnabled (or legacy traceHttp / enabled)",
+    });
+  }
+
+  HTTP_TRACE_ENABLED = next;
+  writeMcpSettings({ ...(readMcpSettings() || {}), httpTraceEnabled: next });
+
+  return res.json({
+    ok: true,
+    httpTraceEnabled: HTTP_TRACE_ENABLED,
+    traceHttp: HTTP_TRACE_ENABLED,
+    enabled: HTTP_TRACE_ENABLED,
+  });
+});
+
+// ---- Concepts overrides (editable UI) ----
+app.get("/api/concepts/overrides", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query?.tenant || "default");
+  const ov = readConceptOverrides(tenantId);
+  res.json({ tenantId, overrides: ov || {} });
+});
+
+app.put("/api/concepts/overrides", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query?.tenant || "default");
+  const overrides = req.body || {};
+  const ok = writeConceptOverrides(tenantId, overrides);
+  res.status(ok ? 200 : 500).json({ ok: !!ok });
+});
+
+
+// ---- Relationships registry (admin UI) ----
+function ensureRelDir() {
+  const dir = path.join(DATA_DIR, "relationships");
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const bdir = path.join(dir, "backups");
+  try { fs.mkdirSync(bdir, { recursive: true }); } catch {}
+  return { dir, bdir };
+}
+
+function readJsonFile(fp) {
+  try {
+    if (!fp || !fs.existsSync(fp)) return null;
+    const txt = fs.readFileSync(fp, "utf8");
+    return safeJson(txt);
+  } catch {
+    return null;
+  }
+}
+
+function relDefaultsPath() {
+  const { dir } = ensureRelDir();
+  return path.join(dir, "relationships.defaults.json");
+}
+
+function relTenantPath(tenantId) {
+  const { dir } = ensureRelDir();
+  const t = String(tenantId || "default");
+  return path.join(dir, `relationships.${t}.json`);
+}
+
+function mergeRelationships(base, override) {
+  const out = JSON.parse(JSON.stringify(base || { version: 1, relationships: {} }));
+  out.version = out.version || 1;
+  out.relationships = out.relationships || {};
+
+  const o = override && typeof override === "object" ? override : null;
+  const orels = o?.relationships && typeof o.relationships === "object" ? o.relationships : {};
+
+  for (const rootOs of Object.keys(orels)) {
+    out.relationships[rootOs] = out.relationships[rootOs] || {};
+    const byAlias = orels[rootOs] || {};
+    for (const alias of Object.keys(byAlias)) {
+      out.relationships[rootOs][alias] = byAlias[alias];
+    }
+  }
+  return out;
+}
+
+function normalizeRelPayload(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const version = Number(p.version || 1);
+  const relationships = p.relationships && typeof p.relationships === "object" ? p.relationships : {};
+  return { version, relationships };
+}
+
+function validateRelPayload(payload) {
+  const p = normalizeRelPayload(payload);
+  // Basic shape validation.
+  if (!p.relationships || typeof p.relationships !== "object") {
+    return { ok: false, error: "relationships must be an object" };
+  }
+  for (const rootOs of Object.keys(p.relationships)) {
+    const rels = p.relationships[rootOs];
+    if (!rels || typeof rels !== "object") return { ok: false, error: `relationships.${rootOs} must be an object` };
+    for (const alias of Object.keys(rels)) {
+      const cfg = rels[alias];
+      if (!cfg || typeof cfg !== "object") return { ok: false, error: `relationships.${rootOs}.${alias} must be an object` };
+      if (!cfg.relatedOs) return { ok: false, error: `relationships.${rootOs}.${alias}.relatedOs is required` };
+      if (!cfg.rootJoinField) return { ok: false, error: `relationships.${rootOs}.${alias}.rootJoinField is required` };
+      if (!cfg.relatedKeyField) return { ok: false, error: `relationships.${rootOs}.${alias}.relatedKeyField is required` };
+      if (cfg.maxKeys != null && (Number(cfg.maxKeys) <= 0 || !Number.isFinite(Number(cfg.maxKeys)))) {
+        return { ok: false, error: `relationships.${rootOs}.${alias}.maxKeys must be a positive number` };
+      }
+    }
+  }
+  return { ok: true, payload: p };
+}
+
+function writeJsonAtomic(fp, obj) {
+  const dir = path.dirname(fp);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const tmp = `${fp}.tmp.${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
+  fs.renameSync(tmp, fp);
+}
+
+function backupFileIfExists(fp) {
+  try {
+    if (!fp || !fs.existsSync(fp)) return null;
+    const { bdir } = ensureRelDir();
+    const base = path.basename(fp);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const out = path.join(bdir, `${base}.${stamp}`);
+    fs.copyFileSync(fp, out);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+app.get("/api/relationships", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query?.tenant || "default");
+  const scope = String(req.query?.scope || "effective"); // effective | defaults | tenant
+
+  const defaultsPath = relDefaultsPath();
+  const tenantPath = relTenantPath(tenantId);
+
+  const defaults = readJsonFile(defaultsPath) || { version: 1, relationships: {} };
+  const tenant = readJsonFile(tenantPath) || { version: 1, relationships: {} };
+  const effective = mergeRelationships(normalizeRelPayload(defaults), normalizeRelPayload(tenant));
+
+  if (scope === "defaults") {
+    return res.json({ tenantId, scope, sourceFile: defaultsPath, data: normalizeRelPayload(defaults) });
+  }
+  if (scope === "tenant") {
+    return res.json({ tenantId, scope, sourceFile: tenantPath, data: normalizeRelPayload(tenant) });
+  }
+  return res.json({ tenantId, scope: "effective", sourceFiles: { defaults: defaultsPath, tenant: tenantPath }, data: effective });
+});
+
+app.put("/api/relationships", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query?.tenant || "default");
+  const scope = String(req.query?.scope || "tenant"); // tenant | defaults
+
+  if (scope !== "tenant" && scope !== "defaults") {
+    return res.status(400).json({ ok: false, error: "bad_scope", detail: "scope must be tenant or defaults" });
+  }
+
+  const v = validateRelPayload(req.body);
+  if (!v.ok) return res.status(400).json({ ok: false, error: "invalid_payload", detail: v.error });
+
+  const fp = scope === "defaults" ? relDefaultsPath() : relTenantPath(tenantId);
+  const backup = backupFileIfExists(fp);
+  try {
+    writeJsonAtomic(fp, v.payload);
+    const size = fs.statSync(fp).size;
+    return res.json({ ok: true, tenantId, scope, savedFile: fp, backupFile: backup, bytes: size });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "write_failed", detail: String(e?.message || e) });
+  }
+});
+
+// -------------------- saved tools admin api (NEW) --------------------
+app.get("/api/tools", (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  const tools = readSavedTools(tenantId);
+  res.json({ tenant: tenantId, tools });
+});
+
+// Create/update/delete tools are admin-only. USER role gets a read-only Tools page.
+app.post("/api/tools", requireAdmin(), (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const tool = req.body?.tool;
+  try {
+    const saved = upsertSavedTool(tenantId, tool);
+    res.json({ ok: true, tenant: tenantId, tool: saved });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.put("/api/tools/:name", requireAdmin(), (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const name = String(req.params.name || "");
+  const tool = { ...(req.body?.tool || {}), name };
+  try {
+    const saved = upsertSavedTool(tenantId, tool);
+    res.json({ ok: true, tenant: tenantId, tool: saved });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.delete("/api/tools/:name", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query?.tenant || req.body?.tenant || "default");
+  const name = String(req.params.name || "");
+  const ok = deleteSavedTool(tenantId, name);
+  res.json({ ok, tenant: tenantId, name });
+});
+
+
+// -------------------- enabled tools admin api (NEW) --------------------
+app.get("/api/enabled-tools", (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  const enabledTools = readEnabledTools(tenantId);
+  res.json({ tenant: tenantId, enabledTools });
+});
+
+// Toggle a tool enabled/disabled for this tenant (applies to built-ins + saved tools)
+app.put("/api/enabled-tools/:name", requireAdmin(), (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const name = String(req.params.name || "");
+  const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : null;
+  if (!name) return res.status(400).json({ ok: false, error: "missing_name" });
+  if (enabled === null) return res.status(400).json({ ok: false, error: "missing_enabled_boolean" });
+
+  // If allowlist doesn't exist yet, initialize it to "everything currently known is enabled"
+  const current = readEnabledTools(tenantId);
+  const knownNames = mcpToolsForTenant(tenantId, { all: true }).map((t) => String(t?.name || "")).filter(Boolean);
+  const baseline = current && Array.isArray(current) ? current : knownNames;
+
+  let next = baseline.slice();
+  if (enabled) {
+    if (!next.includes(name)) next.push(name);
+  } else {
+    next = next.filter((x) => x !== name);
+  }
+
+  next = writeEnabledTools(tenantId, next);
+  res.json({ ok: true, tenant: tenantId, name, enabled, enabledTools: next });
+});
+
+
+// Backward compat: UI may POST instead of PUT (admin-only)
+app.post("/api/settings", requireAdmin(), (req, res) => {
+  const v = req.body?.httpTraceEnabled;
+  const legacy = req.body?.traceHttp;
+  const enabled = req.body?.enabled;
+
+  const next =
+    typeof v === "boolean" ? v :
+    typeof legacy === "boolean" ? legacy :
+    typeof enabled === "boolean" ? enabled :
+    null;
+
+  if (typeof next !== "boolean") {
+    return res.status(400).json({
+      error: "bad_request",
+      detail: "Body must include boolean httpTraceEnabled (or legacy traceHttp / enabled)",
+    });
+  }
+
+  HTTP_TRACE_ENABLED = next;
+  writeMcpSettings({ ...(readMcpSettings() || {}), httpTraceEnabled: next });
+
+  return res.json({
+    ok: true,
+    httpTraceEnabled: HTTP_TRACE_ENABLED,
+    traceHttp: HTTP_TRACE_ENABLED,
+    enabled: HTTP_TRACE_ENABLED,
+  });
+});
+
+
+// -------------------- BACKWARD COMPAT: /api/trace --------------------
+// The UI expects /api/trace. Keep it stable even if we also support /api/settings.
+
+app.get("/api/trace", (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 2000), 5000);
+
+  // Combine Maximo responses + inbound HTTP responses for a single "payload/token trace" view.
+  // Tokens≈ bytes ÷ 4 (rough heuristic).
+  const events = LOGS.filter((e) => e.kind === "rx_maximo" || e.kind === "http_in").slice(-limit);
+
+  // Recent: latest events first
+  const recent = events
+    .slice(-200)
+    .map((e) => ({
+      id: e.id,
+      ts: e.ts,
+      title: e.title || "",
+      status: e.status,
+      routeKey: e.routeKey || undefined,
+      ms: e.ms,
+      reqTokensApprox: e.reqTokensApprox,
+      resTokensApprox: e.resTokensApprox,
+      requestBytes: e.requestBytes,
+      responseBytes: e.responseBytes,
+      kind: e.kind,
+    }))
+    .reverse();
+
+  // Aggregates: group by routeKey (for http_in) or by URL path (for rx_maximo)
+  const byKey = new Map();
+  for (const e of events) {
+    const key =
+      e.kind === "http_in"
+        ? String(e.routeKey || e.title || "unknown")
+        : String((e.url || "").split("?")[0] || e.title || "unknown");
+
+    const cur = byKey.get(key) || {
+      key,
+      count: 0,
+      sumResBytes: 0,
+      sumResTokens: 0,
+      maxResTokens: 0,
+      sumMs: 0,
+    };
+
+    const resBytes = Number(e.responseBytes || 0);
+    const resTokens = Number(e.resTokensApprox || 0);
+    const ms = Number(e.ms || 0);
+
+    cur.count += 1;
+    cur.sumResBytes += resBytes;
+    cur.sumResTokens += resTokens;
+    cur.maxResTokens = Math.max(cur.maxResTokens, resTokens);
+    cur.sumMs += ms;
+
+    byKey.set(key, cur);
+  }
+
+  const aggregates = Array.from(byKey.values())
+    .map((a) => ({
+      key: a.key,
+      count: a.count,
+      avgResBytes: a.count ? Math.round(a.sumResBytes / a.count) : 0,
+      avgResTokensApprox: a.count ? Math.round(a.sumResTokens / a.count) : 0,
+      maxResTokensApprox: a.maxResTokens,
+      avgMs: a.count ? Math.round(a.sumMs / a.count) : 0,
+    }))
+    .sort((a, b) => (b.avgResBytes || 0) - (a.avgResBytes || 0))
+    .slice(0, 50);
+
+  return res.json({
+    httpTraceEnabled: HTTP_TRACE_ENABLED,
+    traceHttp: HTTP_TRACE_ENABLED,
+    enabled: HTTP_TRACE_ENABLED,
+    tokensHeuristic: "Tokens≈ bytes ÷ 4",
+    aggregates,
+    recent,
+  });
+});
+
+// Enabling/disabling trace is an admin-only action.
+app.put("/api/trace", requireAdmin(), (req, res) => {
+  const v = req.body?.httpTraceEnabled;
+  const legacy = req.body?.enabled;
+
+  const next =
+    typeof v === "boolean" ? v :
+    typeof legacy === "boolean" ? legacy :
+    null;
+
+  if (typeof next !== "boolean") {
+    return res.status(400).json({
+      error: "bad_request",
+      detail: "Body must include boolean httpTraceEnabled (or legacy boolean enabled)",
+    });
+  }
+
+  HTTP_TRACE_ENABLED = next;
+  writeMcpSettings({ ...(readMcpSettings() || {}), httpTraceEnabled: next });
+
+  return res.json({
+    ok: true,
+    httpTraceEnabled: HTTP_TRACE_ENABLED,
+    enabled: HTTP_TRACE_ENABLED,
+  });
+});
+
+
+// ---------- OS allowlist admin api ----------
+// This endpoint is used by the admin Settings UI to manage an OS allowlist.
+// USER role should not be able to change allowlists.
+app.get("/api/os", requireAdmin(), async (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  try {
+    const t = tenantOrThrow(tenantId, requestOrigin(req));
+
+    const allowlist = readAllowlist(tenantId);
+
+    let names = [];
+    let discoverySupported = true;
+    let warning = null;
+
+    try {
+      const out = await fetchOsListBestEffort(t);
+      names = out.names || [];
+    } catch (e) {
+      discoverySupported = false;
+      warning = String(e?.message || e);
+      names = Array.isArray(allowlist) ? allowlist : [];
+    }
+
+    const baseList = Array.from(new Set([...(names || []), ...((allowlist || []) ?? [])])).sort();
+
+    const entries = baseList.map((name) => ({
+      name,
+      allowed: allowlist ? allowlist.includes(name) : true,
+    }));
+
+    return res.json({
+      tenant: tenantId,
+      discoverySupported,
+      warning,
+      allowlist: allowlist || [],
+      entries,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "os_list_failed", detail: String(e?.message || e) });
+  }
+});
+
+app.put("/api/os/allowlist", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  try {
+    const allowed = Array.isArray(req.body?.allowed) ? req.body.allowed : [];
+    const saved = writeAllowlist(tenantId, allowed);
+    return res.json({ ok: true, tenant: tenantId, allowed: saved });
+  } catch (e) {
+    return res.status(500).json({ error: "allowlist_save_failed", detail: String(e?.message || e) });
+  }
+});
+
+
+// ---------- NLQ (Option A + E Phase 2) ----------
+// This adds deterministic natural-language query expansion for Maximo queryOS.
+// Inputs: req.body.userText (string) and args.os/args.where (optional)
+// Outputs: args.os, args.where (and debug meta when requested).
+
+function nlqDataDir() {
+  return path.join(process.env.DATA_DIR || "/data", "nlq");
+}
+
+function nlqMetadataDir(tenantId) {
+  return path.join(nlqDataDir(), "metadata", String(tenantId || "default"));
+}
+
+function nlqRulesPaths(tenantId) {
+  const dir = nlqDataDir();
+  return {
+    base: path.join(dir, "rules.default.json"),
+    tenant: path.join(dir, `rules.tenant.${String(tenantId || "default")}.json`),
+  };
+}
+
+function ensureNlqDefaults() {
+  const dir = nlqDataDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const { base } = nlqRulesPaths("default");
+  if (!fs.existsSync(base)) {
+    const defaults = {
+      version: 1,
+      objects: [
+        { phrase: "work orders", os: "mxapiwo", object: "WORKORDER" },
+        { phrase: "work order", os: "mxapiwo", object: "WORKORDER" },
+        { phrase: "wo", os: "mxapiwo", object: "WORKORDER" },
+        { phrase: "assets", os: "mxapiasset", object: "ASSET" },
+        { phrase: "asset", os: "mxapiasset", object: "ASSET" },
+        { phrase: "service requests", os: "mxapisr", object: "SR" },
+        { phrase: "service request", os: "mxapisr", object: "SR" },
+        { phrase: "sr", os: "mxapisr", object: "SR" },
+
+        // Additional common Maximo OSLC object structures (tenant defaults can override).
+        { phrase: "preventive maintenance", os: "mxapipm", object: "PM" },
+        { phrase: "pm", os: "mxapipm", object: "PM" },
+        { phrase: "pms", os: "mxapipm", object: "PM" },
+        { phrase: "job plans", os: "mxapijobplan", object: "JOBPLAN" },
+        { phrase: "job plan", os: "mxapijobplan", object: "JOBPLAN" },
+        { phrase: "purchase orders", os: "mxapipo", object: "PO" },
+        { phrase: "purchase order", os: "mxapipo", object: "PO" },
+        { phrase: "pos", os: "mxapipo", object: "PO" },
+        { phrase: "requisitions", os: "mxapipr", object: "PR" },
+        { phrase: "requisition", os: "mxapipr", object: "PR" },
+        { phrase: "prs", os: "mxapipr", object: "PR" },
+        { phrase: "inventory", os: "mxapiinventory", object: "INVENTORY" },
+        { phrase: "inspection forms", os: "mxapiinspform", object: "INSPFORM" },
+        { phrase: "inspection form", os: "mxapiinspform", object: "INSPFORM" },
+
+        // Meter readings
+        // NOTE: mxapimeterdata maps to non-persistent APIMETERDATA in many MAS setups.
+        // Prefer the persistent CBM measurement OS, with mxapiassetmeter as a fallback.
+        // - MXAPIMEASUREMENTCBM: reading history (preferred)
+        // - mxapiassetmeter: asset meter definitions/last reading (fallback)
+        { phrase: "meter readings", os: "mxapimeasurementcbm", object: "MEASUREMENT" },
+        { phrase: "meter reading", os: "mxapimeasurementcbm", object: "MEASUREMENT" },
+        { phrase: "asset meters", os: "mxapiassetmeter", object: "ASSETMETER" },
+        { phrase: "asset meter", os: "mxapiassetmeter", object: "ASSETMETER" }
+      ],
+      filters: {
+        mxapiasset: [
+          { phrase: "not ready", filter: { field: "status", op: "=", value: "NOT READY" } },
+          { phrase: "not-ready", filter: { field: "status", op: "=", value: "NOT READY" } },
+          { phrase: "notready", filter: { field: "status", op: "=", value: "NOT READY" } }
+        ],
+        // Helpful built-in work order phrases. These are intentionally conservative
+        // (we avoid complex IN() syntax to keep OSLC parsers happy).
+        mxapiwo: [
+          { phrase: "closed", filter: { field: "status", op: "=", value: "CLOSE" } },
+          { phrase: "open", filter: { field: "status", op: "!=", value: "CLOSE" } },
+          { phrase: "corrective", filter: { field: "worktype", op: "=", value: "CM" } }
+        ]
+      }
+    };
+    fs.writeFileSync(base, JSON.stringify(defaults, null, 2));
+  }
+}
+
+function readNlqRules(tenantId) {
+  ensureNlqDefaults();
+  const { base, tenant } = nlqRulesPaths(tenantId);
+  let b = {};
+  let t = {};
+  try { b = JSON.parse(fs.readFileSync(base, "utf-8")); } catch { b = {}; }
+  try { if (fs.existsSync(tenant)) t = JSON.parse(fs.readFileSync(tenant, "utf-8")); } catch { t = {}; }
+  const merged = { ...(b || {}), ...(t || {}) };
+  merged.objects = Array.isArray(t?.objects) ? t.objects : (Array.isArray(b?.objects) ? b.objects : []);
+  merged.filters = { ...(b?.filters || {}), ...(t?.filters || {}) };
+
+  // Backward-compatible hardening: if the defaults file already exists from an older run,
+  // it may be missing the newer helpful rules. Inject them in-memory (without overwriting
+  // tenant overrides) so NLQ keeps improving even on long-lived volumes.
+  const ensureObject = (phrase, os, object) => {
+    if (!Array.isArray(merged.objects)) merged.objects = [];
+    const exists = merged.objects.some((o) => String(o?.phrase || "").toLowerCase() === String(phrase).toLowerCase());
+    if (!exists) merged.objects.unshift({ phrase, os, object });
+  };
+  ensureObject("work orders", "mxapiwo", "WORKORDER");
+  ensureObject("work order", "mxapiwo", "WORKORDER");
+  ensureObject("wo", "mxapiwo", "WORKORDER");
+
+  // Keep commonly-requested OSes available even on long-lived volumes that still have
+  // an older rules.default.json.
+  ensureObject("preventive maintenance", "mxapipm", "PM");
+  ensureObject("pm", "mxapipm", "PM");
+  ensureObject("pms", "mxapipm", "PM");
+  ensureObject("job plans", "mxapijobplan", "JOBPLAN");
+  ensureObject("job plan", "mxapijobplan", "JOBPLAN");
+  ensureObject("purchase orders", "mxapipo", "PO");
+  ensureObject("purchase order", "mxapipo", "PO");
+  ensureObject("pos", "mxapipo", "PO");
+  ensureObject("requisitions", "mxapipr", "PR");
+  ensureObject("requisition", "mxapipr", "PR");
+  ensureObject("prs", "mxapipr", "PR");
+  ensureObject("inventory", "mxapiinventory", "INVENTORY");
+  ensureObject("inspection forms", "mxapiinspform", "INSPFORM");
+  ensureObject("inspection form", "mxapiinspform", "INSPFORM");
+  // NOTE: mxapimeterdata is often non-persistent (APIMETERDATA). Prefer persistent CBM OS.
+  ensureObject("meter readings", "mxapimeasurementcbm", "MEASUREMENT");
+  ensureObject("meter reading", "mxapimeasurementcbm", "MEASUREMENT");
+  ensureObject("asset meters", "mxapiassetmeter", "ASSETMETER");
+  ensureObject("asset meter", "mxapiassetmeter", "ASSETMETER");
+
+  // Expand defaults over time (without overwriting tenant overrides)
+  ensureObject("preventive maintenance", "mxapipm", "PM");
+  ensureObject("pm", "mxapipm", "PM");
+  ensureObject("pms", "mxapipm", "PM");
+  ensureObject("job plans", "mxapijobplan", "JOBPLAN");
+  ensureObject("job plan", "mxapijobplan", "JOBPLAN");
+  ensureObject("purchase orders", "mxapipo", "PO");
+  ensureObject("purchase order", "mxapipo", "PO");
+  ensureObject("pos", "mxapipo", "PO");
+  ensureObject("requisitions", "mxapipr", "PR");
+  ensureObject("requisition", "mxapipr", "PR");
+  ensureObject("prs", "mxapipr", "PR");
+  ensureObject("inventory", "mxapiinventory", "INVENTORY");
+  ensureObject("inspection forms", "mxapiinspform", "INSPFORM");
+  ensureObject("inspection form", "mxapiinspform", "INSPFORM");
+  ensureObject("meter readings", "mxapimeasurementcbm", "MEASUREMENT");
+  ensureObject("meter reading", "mxapimeasurementcbm", "MEASUREMENT");
+  ensureObject("asset meters", "mxapiassetmeter", "ASSETMETER");
+  ensureObject("asset meter", "mxapiassetmeter", "ASSETMETER");
+
+  if (!merged.filters) merged.filters = {};
+  if (!Array.isArray(merged.filters.mxapiwo)) {
+    merged.filters.mxapiwo = [
+      { phrase: "closed", filter: { field: "status", op: "=", value: "CLOSE" } },
+      { phrase: "open", filter: { field: "status", op: "!=", value: "CLOSE" } },
+      { phrase: "corrective", filter: { field: "worktype", op: "=", value: "CM" } }
+    ];
+  }
+  return merged;
+}
+
+function writeNlqRules(tenantId, rulesObj) {
+  ensureNlqDefaults();
+  const { tenant } = nlqRulesPaths(tenantId);
+  fs.writeFileSync(tenant, JSON.stringify(rulesObj ?? {}, null, 2));
+  return true;
+}
+
+function normalizeKey(s) {
+  return String(s || "").trim().toLowerCase().replace(/[_\-\s]+/g, "");
+}
+
+function textIncludesPhrase(text, phrase) {
+  const t = String(text || "").toLowerCase();
+  const p = String(phrase || "").toLowerCase();
+  if (!t || !p) return false;
+  return t.includes(p);
+}
+
+function resolveOsFromText(text, rules) {
+  const objects = Array.isArray(rules?.objects) ? rules.objects : [];
+  const t = String(text || "").toLowerCase();
+
+  // Choose the *best* matching object structure instead of the first match.
+  // This avoids cases like: "work orders for asset X" incorrectly resolving to mxapiasset
+  // just because the word "asset" appears.
+  let best = { os: "", score: -1 };
+  for (const o of objects) {
+    const phrase = String(o?.phrase || "").toLowerCase().trim();
+    const os = String(o?.os || "").trim().toLowerCase();
+    if (!phrase || !os) continue;
+    const idx = t.indexOf(phrase);
+    if (idx < 0) continue;
+
+    // Score: longer phrases win; earlier appearance is a mild tie-breaker.
+    const score = (phrase.length * 1000) - Math.min(idx, 999);
+    if (score > best.score) best = { os, score };
+  }
+  return best.os || "";
+}
+
+function resolveFiltersFromText(osKey, text, rules) {
+  const list = (rules?.filters && rules.filters[osKey]) ? rules.filters[osKey] : [];
+  const applied = [];
+  const filters = [];
+  for (const r of (Array.isArray(list) ? list : [])) {
+    if (r?.phrase && r?.filter && textIncludesPhrase(text, r.phrase)) {
+      applied.push({ phrase: r.phrase, filter: r.filter });
+      filters.push(r.filter);
+    }
+  }
+  return { filters, applied };
+}
+
+function compileFiltersToWhere(filters) {
+  const parts = [];
+  for (const f of (Array.isArray(filters) ? filters : [])) {
+    const field = String(f?.field || "").trim();
+    const op = String(f?.op || "").trim();
+    const value = String(f?.value || "");
+    if (!field || !op) continue;
+    const safeVal = value.replace(/"/g, '\\"');
+    parts.push(`${field}${op}"${safeVal}"`);
+  }
+
+
+  return parts.join(" and ");
+}
+
+// --- OSLC field discovery + field mapping ---
+// Goal: avoid "invalid query term" by mapping NLQ fields to actual OSLC properties.
+// We learn available fields by fetching one record with oslc.select=* (best-effort).
+
+
+// --- OpenAPI (Swagger) discovery for real, tenant-specific schemas ---
+// Maximo exposes a dynamic OpenAPI spec that reflects configured Object Structures.
+// IBM docs: /maximo/oslc/oas?includeaction=1 or Swagger UI at /maximo/api.html. citeturn1search1
+const _oasCache = new Map(); // key: `${tenantId}` -> { ts, oas }
+
+function maximoOasUrl(t) {
+  const b = normalizeBaseUrl(t.baseUrl);
+  const base = b.endsWith("/maximo") ? b : b + "/maximo";
+  return `${base}/oslc/oas?includeaction=1`;
+}
+
+async function fetchOasDoc({ tenantId, t }) {
+  const ttlMs = Number(process.env.NLQ_OAS_TTL_MS || (24 * 60 * 60 * 1000));
+  const now = Date.now();
+  const cached = _oasCache.get(tenantId);
+  if (cached && (now - cached.ts) < ttlMs) return cached.oas;
+
+  const url = maximoOasUrl(t);
+  const headers = authHeaders(t);
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) throw new Error(`oas_http_${resp.status}`);
+  const oas = await resp.json();
+  _oasCache.set(tenantId, { ts: now, oas });
+  return oas;
+}
+
+function _oasResolveRef(oas, ref) {
+  if (!ref || typeof ref !== "string") return null;
+  if (!ref.startsWith("#/")) return null;
+  const parts = ref.slice(2).split("/");
+  let cur = oas;
+  for (const p of parts) {
+    if (!cur || typeof cur !== "object") return null;
+    cur = cur[p];
+  }
+  return cur && typeof cur === "object" ? cur : null;
+}
+
+function extractFieldsFromOas(oas, os) {
+  try {
+    const osKey = String(os || "").toLowerCase();
+    const paths = oas?.paths && typeof oas.paths === "object" ? oas.paths : {};
+    let bestPath = null;
+    for (const p of Object.keys(paths)) {
+      const pl = String(p).toLowerCase();
+      if (pl.endsWith(`/os/${osKey}`)) { bestPath = p; break; }
+      if (pl.endsWith(`/api/os/${osKey}`)) { bestPath = p; break; }
+    }
+    if (!bestPath) return null;
+
+    const getOp = paths?.[bestPath]?.get || paths?.[bestPath]?.GET;
+    const resp200 = getOp?.responses?.["200"] || getOp?.responses?.["201"] || null;
+    const content = resp200?.content?.["application/json"] || resp200?.content?.["application/ld+json"] || null;
+    let schema = content?.schema || resp200?.schema || null;
+    if (schema?.$ref) schema = _oasResolveRef(oas, schema.$ref);
+
+    // Typical Maximo list response has a "member" array with items = resource schema
+    const member = schema?.properties?.member || schema?.properties?.["rdfs:member"] || null;
+    let itemSchema = member?.items || null;
+    if (itemSchema?.$ref) itemSchema = _oasResolveRef(oas, itemSchema.$ref);
+
+    // Sometimes schema itself is the item (not wrapped)
+    const candidate = itemSchema || schema;
+    const props = candidate?.properties && typeof candidate.properties === "object" ? candidate.properties : null;
+    if (!props) return null;
+
+    return new Set(Object.keys(props).map(k => String(k).trim()).filter(Boolean));
+  } catch {
+    return null;
+  }
+}
+
+function extractRelationsFromOas(oas, os) {
+  // Best-effort: infer relationship properties for an Object Structure from the OpenAPI schema.
+  // Returns: Map<relationNameLower, { name, fields:Set<string> }>
+  try {
+    const osKey = String(os || "").toLowerCase();
+    const paths = oas?.paths && typeof oas.paths === "object" ? oas.paths : {};
+    let bestPath = null;
+    for (const p of Object.keys(paths)) {
+      const pl = String(p).toLowerCase();
+      if (pl.endsWith(`/os/${osKey}`)) { bestPath = p; break; }
+      if (pl.endsWith(`/api/os/${osKey}`)) { bestPath = p; break; }
+    }
+    if (!bestPath) return null;
+
+    const getOp = paths?.[bestPath]?.get || paths?.[bestPath]?.GET;
+    const resp200 = getOp?.responses?.["200"] || getOp?.responses?.["201"] || null;
+    const content = resp200?.content?.["application/json"] || resp200?.content?.["application/ld+json"] || null;
+    let schema = content?.schema || resp200?.schema || null;
+    if (schema?.$ref) schema = _oasResolveRef(oas, schema.$ref);
+
+    const member = schema?.properties?.member || schema?.properties?.["rdfs:member"] || null;
+    let itemSchema = member?.items || null;
+    if (itemSchema?.$ref) itemSchema = _oasResolveRef(oas, itemSchema.$ref);
+    const candidate = itemSchema || schema;
+    const props = candidate?.properties && typeof candidate.properties === "object" ? candidate.properties : null;
+    if (!props) return null;
+
+    const rels = new Map();
+    for (const [propName, propSchemaRaw] of Object.entries(props)) {
+      let propSchema = propSchemaRaw;
+      if (propSchema?.$ref) propSchema = _oasResolveRef(oas, propSchema.$ref);
+      // Relationship can be an array of objects, or an object.
+      let relItem = null;
+      if (propSchema?.type === "array" && propSchema?.items) {
+        relItem = propSchema.items;
+        if (relItem?.$ref) relItem = _oasResolveRef(oas, relItem.$ref);
+      } else if (propSchema?.type === "object" && propSchema?.properties) {
+        relItem = propSchema;
+      }
+      const relProps = relItem?.properties && typeof relItem.properties === "object" ? relItem.properties : null;
+      if (!relProps) continue;
+
+      const fields = new Set(Object.keys(relProps).map(k => String(k).trim()).filter(Boolean));
+      const key = String(propName).toLowerCase();
+      rels.set(key, { name: String(propName), fields });
+    }
+    return rels;
+  } catch {
+    return null;
+  }
+}
+const _osFieldCache = new Map(); // key: `${tenantId}:${os}` -> { ts, fields: Set<string> }
+
+const _osRelCache = new Map(); // key: `${tenantId}:${os}` -> { ts, rels: Map<string,{name,fields}> }
+
+async function fetchOsRelations({ tenantId, t, os }) {
+  const key = `${tenantId}:${os}`;
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  const now = Date.now();
+  const cached = _osRelCache.get(key);
+  if (cached && (now - cached.ts) < ttlMs) return cached.rels;
+
+  try {
+    const oas = await fetchOasDoc({ tenantId, t });
+    const rels = extractRelationsFromOas(oas, os);
+    if (rels && rels.size) {
+      _osRelCache.set(key, { ts: now, rels });
+      return rels;
+    }
+  } catch {
+    // best-effort
+  }
+
+  const rels = new Map();
+  _osRelCache.set(key, { ts: now, rels });
+  return rels;
+}
+
+async function fetchOsFields({ tenantId, t, os, rxId }) {
+  const key = `${tenantId}:${os}`;
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  const now = Date.now();
+  const cached = _osFieldCache.get(key);
+  if (cached && (now - cached.ts) < ttlMs) return cached.fields;
+
+  // Prefer OpenAPI (Swagger) schema discovery (authoritative, tenant-specific).
+  try {
+    const oas = await fetchOasDoc({ tenantId, t });
+    const oasFields = extractFieldsFromOas(oas, os);
+    if (oasFields && oasFields.size) {
+      _osFieldCache.set(key, { ts: now, fields: oasFields });
+      return oasFields;
+    }
+  } catch {
+    // best-effort; fall back to runtime probe
+  }
+
+
+  try {
+    // IMPORTANT: use the same Maximo REST base used by queryOS ("/maximo/api"),
+    // not the legacy "/maximo/oslc" path. Tenants can expose different routes,
+    // and we want schema discovery to match the actual OS endpoint we call.
+    const api = maximoApiBase(t);
+    const url = new URL(`${api}/os/${encodeURIComponent(os)}`);
+    url.searchParams.set("oslc.select", "*");
+    url.searchParams.set("oslc.pageSize", "1");
+    url.searchParams.set("lean", "1");
+    const headers = authHeaders(t);
+    const resp = await fetch(url.toString(), { headers });
+    if (!resp.ok) throw new Error(`field_discovery_http_${resp.status}`);
+    const j = await resp.json().catch(() => null);
+
+    // OSLC JSON usually returns member array
+    // Different MAS versions can use slightly different keys.
+    // NOTE: keys like "rdfs:member" must be accessed via bracket notation.
+    const member = j?.member?.[0] || j?.rdfs_member?.[0] || j?.["rdfs:member"]?.[0] || null;
+    if (member && typeof member === "object") {
+      const fields = new Set(Object.keys(member).map(k => String(k).trim()).filter(Boolean));
+      _osFieldCache.set(key, { ts: now, fields });
+      return fields;
+    }
+  } catch {
+    // best-effort
+  }
+
+  const fields = new Set(); // unknown
+  _osFieldCache.set(key, { ts: now, fields });
+  return fields;
+}
+
+// very small "fuzzy" mapper for field names
+function mapFieldName(fieldsSet, requestedField) {
+  const f = String(requestedField || "").trim();
+  if (!f) return f;
+  if (!fieldsSet || fieldsSet.size === 0) return f;
+  if (fieldsSet.has(f)) return f;
+
+  const lower = f.toLowerCase();
+  // common synonyms
+  const synonyms = {
+    wonumber: "wonum",
+    wonum: "wonum",
+    assetnumber: "assetnum",
+    assetnum: "assetnum",
+    assettype: "type",
+    asset_type: "type",
+    workorder: "wonum"
+  };
+  const syn = synonyms[lower];
+  if (syn && fieldsSet.has(syn)) return syn;
+
+  // heuristic: if user asked for "*type", try any field containing "type"
+  if (lower.includes("type")) {
+    const candidates = [...fieldsSet].filter(x => String(x).toLowerCase().includes("type"));
+    if (candidates.length === 1) return candidates[0];
+    // prefer shorter + contains exact substring
+    const exact = candidates.find(c => String(c).toLowerCase() === lower);
+    if (exact) return exact;
+    candidates.sort((a,b) => a.length - b.length);
+    if (candidates.length) return candidates[0];
+  }
+
+  return f;
+}
+
+// Normalize OSLC where strings into a safer subset that Maximo parses reliably.
+function normalizeOslcWhere(where) {
+  let w = String(where || "").trim();
+  if (!w) return w;
+
+  // unescape backslash-escaped quotes produced by some LLMs
+  w = w.replace(/\\'/g, "'").replace(/\\\"/g, '"');
+
+  // collapse doubled quotes: status=""CLOSE"" -> status="CLOSE"
+  w = w.replace(/""([^"]+)""/g, '"$1"');
+
+  // convert single-quoted literals to double quotes: status='CLOSE' -> status="CLOSE"
+  // (best-effort; won't handle nested quotes)
+  w = w.replace(/'([^']*)'/g, (_, v) => `"${String(v).replace(/"/g, '\"')}"`);
+
+  // remove spaces around comparison operators for safer parsing
+  w = w.replace(/\s*(=|!=|>=|<=|>|<)\s*/g, "$1");
+
+  return w;
+}
+
+function extractHeuristicFilters(osKey, text) {
+  const t = String(text || "");
+  const low = t.toLowerCase();
+  const out = [];
+
+  // Common human-to-Maximo status intent (generic):
+  // Many prompts say "approved" / "waiting approval" without the word "status".
+  // We only apply these when there is no explicit "status XYZ" match in the text.
+  const hasExplicitStatus = /\bstatus\s+(?:is\s+)?[A-Za-z0-9_]+\b/i.test(t);
+  if (!hasExplicitStatus) {
+    // Avoid false positives like "not approved" / "unapproved".
+    const negApproved = /\b(not\s+approved|unapproved)\b/i.test(t);
+    if (!negApproved) {
+      if (/\b(waiting\s+approval|awaiting\s+approval|pending\s+approval)\b/i.test(t)) {
+        out.push({ field: "status", op: "=", value: "WAPPR" });
+      } else if (/\bapproved\b/i.test(t)) {
+        out.push({ field: "status", op: "=", value: "APPR" });
+      }
+    }
+
+    // Completion cues
+    if (/\b(completed|complete)\b/i.test(t)) out.push({ field: "status", op: "=", value: "COMP" });
+    if (/\bclosed\b/i.test(t)) out.push({ field: "status", op: "=", value: "CLOSE" });
+    // "open" is fuzzy; keep it simple (not CLOSE) so we don't trigger OSLC IN() parsing issues.
+    if (/\bopen\b/i.test(t)) out.push({ field: "status", op: "!=", value: "CLOSE" });
+  }
+
+  // explicit status term e.g. "status WAPPR" / "status is CLOSE"
+  // Keep this generic; schema validation later will drop it if the OS doesn't expose "status".
+  const mStatus = t.match(/\bstatus\s+(?:is\s+)?([A-Za-z0-9_]+)\b/i);
+  if (mStatus && mStatus[1]) {
+    out.push({ field: "status", op: "=", value: String(mStatus[1]).trim() });
+  }
+
+  // asset identifier e.g. "asset BK1000001" / "for asset BK1000001"
+  const mAsset = t.match(/\basset\s+([A-Za-z0-9][A-Za-z0-9_-]*)\b/i);
+  if (mAsset && mAsset[1]) {
+    const assetnum = String(mAsset[1]).trim();
+    if (osKey === "mxapiwo" || osKey === "mxapisr" || osKey === "mxapipm" || osKey === "mxapimeasurementcbm" || osKey === "mxapiassetmeter") {
+      out.push({ field: "assetnum", op: "=", value: assetnum });
+    } else if (osKey === "mxapiasset") {
+      out.push({ field: "assetnum", op: "=", value: assetnum });
+    }
+  }
+
+  // basic work order intent cues
+  if (osKey === "mxapiwo") {
+    if (low.includes("corrective")) out.push({ field: "worktype", op: "=", value: "CM" });
+    if (low.includes("preventive")) out.push({ field: "worktype", op: "=", value: "PM" });
+    // Note: status cues are handled above in a generic way (approved/pending/closed/open/etc.).
+
+    // Relationship cue: "work orders for assets of type SENSOR" -> asset.assettype="SENSOR"
+    const mAssetType = t.match(/\bassets?\s+of\s+type\s+([A-Za-z0-9_-]+)\b/i);
+    if (mAssetType && mAssetType[1]) {
+      out.push({ field: "asset.assettype", op: "=", value: String(mAssetType[1]).trim() });
+    }
+  }
+
+  // Meter-reading intent: keep it simple and deterministic.
+  // If the OS is meter reading and the user asked for "last/latest", request sorting.
+  if (osKey === "mxapimeasurementcbm" || osKey === "mxapiassetmeter") {
+    if (/\b(last|latest|most\s+recent)\b/i.test(t)) {
+      out.push({ field: "_mcp.orderBy", op: "=", value: "-readingdate" });
+    }
+  }
+
+  return out;
+}
+
+async function loadAssetStatusValues(t, tenantId, rxId, aiMeta) {
+  const dir = nlqMetadataDir(tenantId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, "mxapiassetstatus.values.json");
+
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  try {
+    const st = fs.statSync(p);
+    if ((Date.now() - st.mtimeMs) < ttlMs) {
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (Array.isArray(j?.values)) return j.values;
+    }
+  } catch {}
+
+  const api = maximoApiBase(t);
+  const qs = new URLSearchParams();
+  qs.set("lean", "1");
+  qs.set("oslc.pageSize", "200");
+  qs.set("oslc.select", "status,description,value,maxvalue");
+  const url = `${api}/os/${encodeURIComponent("MXAPIASSETSTATUS")}?${qs.toString()}`;
+  const headers = authHeaders(t);
+
+  try {
+    const out = await maximoFetch(t, {
+      method: "GET",
+      url,
+      headers,
+      kind: "tx_maximo",
+      title: `→ Maximo OS MXAPIASSETSTATUS (metadata)`,
+      meta: { tool: "nlq_metadata", relatedId: rxId, ...(aiMeta || {}) },
+    });
+    const ct = (out.r.headers.get("content-type") || "").toLowerCase();
+    let values = [];
+    if (out.r.ok && ct.includes("application/json")) {
+      const body = safeJson(out.respText);
+      const members = getOslcMembers(body);
+      const set = new Set();
+      for (const m of members) {
+        const cand = [m?.status, m?.value, m?.maxvalue, m?.domainvalue, m?.alnvalue, m?.synonymvalue, m?.internalvalue]
+          .filter((x) => typeof x === "string" && x.trim());
+        for (const c of cand) set.add(String(c).trim());
+      }
+      values = Array.from(set);
+    }
+    if (!values.length) values = ["NOT READY"];
+    fs.writeFileSync(p, JSON.stringify({ fetchedAt: new Date().toISOString(), values }, null, 2));
+    return values;
+  } catch (e) {
+    const values = ["NOT READY"];
+    try { fs.writeFileSync(p, JSON.stringify({ fetchedAt: new Date().toISOString(), values, error: String(e?.message || e) }, null, 2)); } catch {}
+    return values;
+  }
+}
+
+// Phase 2: schema grounding via MXOBJECTCFG + synonym normalization via MXAPISYNONYMDOMAIN.
+async function loadObjectCfgForObject(t, tenantId, rxId, aiMeta, objectName) {
+  const dir = nlqMetadataDir(tenantId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const key = String(objectName || "").trim().toUpperCase();
+  const p = path.join(dir, `mxobjectcfg.${key}.json`);
+
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  try {
+    const st = fs.statSync(p);
+    if ((Date.now() - st.mtimeMs) < ttlMs) {
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (j && typeof j === "object") return j;
+    }
+  } catch {}
+
+  const api = maximoApiBase(t);
+  const qs = new URLSearchParams();
+  qs.set("lean", "1");
+  qs.set("oslc.pageSize", "2000");
+  qs.set("oslc.select", "objectname,attributename,domainid,maxtype,remarks");
+  qs.set("oslc.where", `objectname="${key}"`);
+  const url = `${api}/os/${encodeURIComponent("MXOBJECTCFG")}?${qs.toString()}`;
+
+  const out = await maximoFetch(t, {
+    method: "GET",
+    url,
+    headers: authHeaders(t),
+    kind: "tx_maximo",
+    title: `→ Maximo OS MXOBJECTCFG (${key})`,
+    meta: { tool: "nlq_metadata", relatedId: rxId, ...(aiMeta || {}) },
+  });
+
+  let schema = { object: key, fields: [], domains: {} };
+  const ct = (out.r.headers.get("content-type") || "").toLowerCase();
+  if (out.r.ok && ct.includes("application/json")) {
+    const body = safeJson(out.respText);
+    const members = getOslcMembers(body);
+    const fields = new Set();
+    const domains = {};
+    for (const m of members) {
+      const attr = String(m?.attributename || "").trim();
+      if (!attr) continue;
+      fields.add(attr.toLowerCase());
+      const dom = String(m?.domainid || "").trim();
+      if (dom) domains[attr.toLowerCase()] = dom;
+    }
+    schema = { object: key, fields: Array.from(fields).sort(), domains };
+  }
+  fs.writeFileSync(p, JSON.stringify({ fetchedAt: new Date().toISOString(), ...schema }, null, 2));
+  return schema;
+}
+
+async function loadSynonymDomainMap(t, tenantId, rxId, aiMeta, domainId) {
+  const dir = nlqMetadataDir(tenantId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const key = String(domainId || "").trim().toUpperCase();
+  const p = path.join(dir, `mxapisynonymdomain.${key}.json`);
+
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  try {
+    const st = fs.statSync(p);
+    if ((Date.now() - st.mtimeMs) < ttlMs) {
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (j && typeof j === "object" && j.map) return j.map;
+    }
+  } catch {}
+
+  const api = maximoApiBase(t);
+  const qs = new URLSearchParams();
+  qs.set("lean", "1");
+  qs.set("oslc.pageSize", "2000");
+  qs.set("oslc.select", "domainid,value,description,maxvalue,defaults,internalvalue,synonymvalue");
+  qs.set("oslc.where", `domainid="${key}"`);
+  const url = `${api}/os/${encodeURIComponent("MXAPISYNONYMDOMAIN")}?${qs.toString()}`;
+
+  const out = await maximoFetch(t, {
+    method: "GET",
+    url,
+    headers: authHeaders(t),
+    kind: "tx_maximo",
+    title: `→ Maximo OS MXAPISYNONYMDOMAIN (${key})`,
+    meta: { tool: "nlq_metadata", relatedId: rxId, ...(aiMeta || {}) },
+  });
+
+  const map = {};
+  const ct = (out.r.headers.get("content-type") || "").toLowerCase();
+  if (out.r.ok && ct.includes("application/json")) {
+    const body = safeJson(out.respText);
+    const members = getOslcMembers(body);
+    for (const m of members) {
+      const canonical = String(m?.value || m?.maxvalue || m?.internalvalue || "").trim();
+      if (!canonical) continue;
+      const keys = [
+        m?.value, m?.maxvalue, m?.internalvalue, m?.synonymvalue, m?.description
+      ].filter((x) => typeof x === "string" && x.trim()).map((x) => normalizeKey(x));
+      for (const k of keys) {
+        if (k && !map[k]) map[k] = canonical;
+      }
+    }
+  }
+  fs.writeFileSync(p, JSON.stringify({ fetchedAt: new Date().toISOString(), domain: key, map }, null, 2));
+  return map;
+}
+
+async function loadAlnDomainMap(t, tenantId, rxId, aiMeta, domainId) {
+  const dir = nlqMetadataDir(tenantId);
+  if (!dir) return {};
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const key = String(domainId || "").trim().toUpperCase();
+  const p = path.join(dir, `mxapialndomain.${key}.json`);
+
+  const ttlMs = Number(process.env.NLQ_METADATA_TTL_MS || (24 * 60 * 60 * 1000));
+  try {
+    const st = fs.statSync(p);
+    if ((Date.now() - st.mtimeMs) < ttlMs) {
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (j && typeof j === "object" && j.map) return j.map;
+    }
+  } catch {}
+
+  const api = maximoApiBase(t);
+  const qs = new URLSearchParams();
+  qs.set("lean", "1");
+  qs.set("oslc.pageSize", "2000");
+  qs.set("oslc.select", "domainid,value,alnvalue,description");
+  qs.set("oslc.where", `domainid="${key}"`);
+  const url = `${api}/os/${encodeURIComponent("MXAPIALNDOMAIN")}?${qs.toString()}`;
+
+  const out = await maximoFetch(t, {
+    method: "GET",
+    url,
+    headers: authHeaders(t),
+    kind: "tx_maximo",
+    title: `→ Maximo OS MXAPIALNDOMAIN (${key})`,
+    meta: { tool: "nlq_metadata", relatedId: rxId, ...(aiMeta || {}) },
+  });
+
+  const map = {};
+  const ct = (out.r.headers.get("content-type") || "").toLowerCase();
+  if (out.r.ok && ct.includes("application/json")) {
+    const body = safeJson(out.respText);
+    const members = getOslcMembers(body);
+    for (const m of members) {
+      const val = String(m?.value || m?.alnvalue || "").trim();
+      if (!val) continue;
+      map[normalizeKey(val)] = val;
+    }
+  }
+  fs.writeFileSync(p, JSON.stringify({ fetchedAt: new Date().toISOString(), domainId: key, map }, null, 2));
+  return map;
+}
+
+
+function objectInfoForOs(osKey, rules) {
+  const objects = Array.isArray(rules?.objects) ? rules.objects : [];
+  for (const o of objects) {
+    if (String(o?.os || "").trim().toLowerCase() === String(osKey || "").trim().toLowerCase()) {
+      return { os: String(o.os).trim().toLowerCase(), object: String(o?.object || "").trim().toUpperCase() };
+    }
+  }
+  return { os: String(osKey || "").trim().toLowerCase(), object: "" };
+}
+
+
+async function normalizeFilterValues(osKey, filters, t, tenantId, rxId, aiMeta, rules) {
+  // Phase 2 grounding:
+  // - validate fields via MXOBJECTCFG (when object name known)
+  // - normalize status values via MXAPISYNONYMDOMAIN (domain derived from MXOBJECTCFG or fallback ASSETSTATUS)
+  const info = objectInfoForOs(osKey, rules);
+  let schema = null;
+  try {
+    if (info.object) schema = await loadObjectCfgForObject(t, tenantId, rxId, aiMeta, info.object);
+  } catch {}
+
+  const normalized = [];
+  const dropped = [];
+  let statusMap = null;
+  try {
+    const dom = schema?.domains?.["status"] || schema?.domains?.["status".toLowerCase()];
+    const domainId = dom || (osKey === "mxapiasset" ? "ASSETSTATUS" : "");
+    if (domainId) statusMap = await loadSynonymDomainMap(t, tenantId, rxId, aiMeta, domainId);
+  } catch {}
+
+  const out = (Array.isArray(filters) ? filters : []).filter(Boolean).map((f) => {
+    const field = String(f?.field || "").trim().toLowerCase();
+    if (schema?.fields?.length && field && !schema.fields.includes(field)) {
+      dropped.push({ reason: "unknown_field", field, filter: f });
+      return null;
+    }
+    if (field === "status" && typeof f?.value === "string") {
+      const nk = normalizeKey(f.value);
+      const canonical = (statusMap && statusMap[nk]) ? statusMap[nk] : f.value;
+      if (canonical !== f.value) normalized.push({ field: "status", from: f.value, to: canonical });
+      return { ...f, field, value: canonical };
+    }
+    return { ...f, field };
+  }).filter(Boolean);
+
+  return { filters: out, normalized, dropped, schemaObject: info.object || "" };
+}
+
+async function expandNlqToArgs({ tenantId, t, rxId, aiMeta, userText, args }) {
+  const rules = readNlqRules(tenantId);
+  const text = String(userText || "");
+  const outArgs = { ...(args || {}) };
+
+  const osKey = String(outArgs?.os || "").trim().toLowerCase();
+  let resolvedOs = osKey;
+  if (!resolvedOs) {
+    resolvedOs = resolveOsFromText(text, rules);
+    if (resolvedOs) outArgs.os = resolvedOs;
+  }
+
+  const applied = [];
+  let normalized = [];
+  const hasWhere = !!(outArgs?.where || (outArgs?.params && outArgs.params["oslc.where"]));
+  if (resolvedOs && !hasWhere) {
+    const r = resolveFiltersFromText(resolvedOs, text, rules);
+    const heur = extractHeuristicFilters(resolvedOs, text);
+    applied.push(...(r.applied || []));
+    if (heur.length) applied.push(...heur.map((h) => ({ phrase: "(heuristic)", filter: h })));
+    const combined = [...(r.filters || []), ...heur];
+    const norm = await normalizeFilterValues(resolvedOs, combined, t, tenantId, rxId, aiMeta, rules);
+    normalized = norm.normalized || [];
+        var dropped = norm.dropped || [];
+        var schemaObject = norm.schemaObject || "";
+    const fieldsSet = await fetchOsFields({ tenantId, t, os: resolvedOs || outArgs.os, rxId });
+    const rels = await fetchOsRelations({ tenantId, t, os: resolvedOs || outArgs.os }).catch(() => new Map());
+    // Internal control: allow heuristics to request a specific orderBy without polluting oslc.where.
+    // (Used by meter-reading intent, etc.)
+    const ctrlOrder = (norm.filters || []).find((f) => String(f?.field || "") === "_mcp.orderBy");
+    if (ctrlOrder && !outArgs.orderBy) outArgs.orderBy = String(ctrlOrder.value || "").trim() || outArgs.orderBy;
+
+    const mapped = (norm.filters || []).filter((f) => String(f?.field || "") !== "_mcp.orderBy").map(f => {
+      const fieldRaw = String(f.field || "").trim();
+      // Allow relationship paths (relation.field) and validate against discovered relationship fields
+      if (fieldRaw.includes(".")) {
+        const [relNameReq, relFieldReq] = fieldRaw.split(".", 2).map(s => String(s||"").trim());
+        const relKey = relNameReq.toLowerCase();
+        // Try exact relation match first, then fuzzy match by name or by the presence of the requested field.
+        let rel = rels?.get?.(relKey) || null;
+        if (!rel && rels?.entries) {
+          const wantField = String(relFieldReq || "").trim().toLowerCase();
+          // Prefer name contains
+          for (const [k, v] of rels.entries()) {
+            if (k === relKey) { rel = v; break; }
+            if (k.includes(relKey) || relKey.includes(k)) { rel = v; break; }
+          }
+          // If still not found, pick a relation that actually exposes the requested field (common for asset.assettype)
+          if (!rel && wantField) {
+            for (const [_k, v] of rels.entries()) {
+              if (v?.fields?.has?.(wantField)) { rel = v; break; }
+            }
+          }
+        }
+        // Special-case for a very common Maximo pattern:
+        // Work orders filtered by a related Asset field (e.g. "work orders for assets of type ENGINE").
+        // Many tenants do not expose relationship metadata (or it is blocked), so discovery
+        // cannot always validate `asset.assettype`. We still want to keep it because later
+        // we rewrite it into a safe prefetch + OR clause.
+        if (!rel) {
+          const wantField = String(relFieldReq || "").trim().toLowerCase();
+          if (resolvedOs === "mxapiwo" && relKey === "asset" && wantField === "assettype") {
+            return { ...f, field: "asset.assettype" };
+          }
+          return { ...f, _drop: true, _reason: `Unknown relation '${relNameReq}'` };
+        }
+        const relField = mapFieldName(rel.fields, relFieldReq);
+        if (rel.fields && rel.fields.size && !rel.fields.has(relField)) {
+          return { ...f, _drop: true, _reason: `Unknown field '${relFieldReq}' under relation '${rel.name}'` };
+        }
+        return { ...f, field: `${rel.name}.${relField}` };
+      }
+
+      const mf = mapFieldName(fieldsSet, fieldRaw);
+      return { ...f, field: mf };
+    }).filter(f => {
+      if (f?._drop) {
+        dropped.push({ phrase: "(schema)", filter: f, reason: f._reason });
+        return false;
+      }
+      if (!fieldsSet || fieldsSet.size === 0) return true;
+      return fieldsSet.has(String(f.field || "").trim());
+    });
+
+const where = compileFiltersToWhere(mapped);
+if (where) outArgs.where = where;
+
+  }
+
+  // Simple query-shaping heuristics
+  // - "top 10" => pageSize=10
+  // - "latest"/"most recent" => orderBy=-changedate
+  // - "count" => aggregate result (server returns narrative)
+  const low = String(text || "").toLowerCase();
+  if (resolvedOs) {
+    const mTop = low.match(/\btop\s+(\d{1,3})\b/);
+    if (mTop && mTop[1] && typeof outArgs.pageSize === "undefined") outArgs.pageSize = Number(mTop[1]);
+    if ((low.includes("latest") || low.includes("most recent") || low.includes("recent")) && !outArgs.orderBy) {
+      outArgs.orderBy = "-changedate";
+    }
+    if (low.match(/^\s*count\b/) || low.includes("count all") || low.includes("how many")) {
+      // Tell the query executor to run in aggregate mode.
+      outArgs._mcpResultKind = "aggregate";
+      // Reasonable default breakdown for WOs when the question is vague.
+      if (resolvedOs === "mxapiwo") outArgs._mcpGroupBy = ["status", "worktype"];
+      if (typeof outArgs.pageSize === "undefined") outArgs.pageSize = 200;
+    }
+
+    // Meter reading intent: "last meter readings for asset BK1000001"
+    // Preferred path: query a dedicated meter-reading OS (mxapimeterreading / mxapiassetmeter)
+    // so we don't rely on relationship traversal.
+    if (/\bmeter\s+readings?\b/i.test(text) && /\basset\b/i.test(text)) {
+      if (resolvedOs === "mxapiasset") {
+        // Fallback for tenants that don't expose a meter-reading OS in NLQ rules.
+        outArgs._mcpResultKind = "related_list";
+        outArgs._mcpRelation = "meterreading";
+        outArgs._mcpLimit = 10;
+        if (!outArgs.where) {
+          const m = text.match(/\basset\s+([A-Za-z0-9][A-Za-z0-9_-]*)\b/i);
+          if (m && m[1]) outArgs.where = `assetnum="${String(m[1]).trim()}"`;
+        }
+      } else {
+        // Dedicated meter-reading OS: default to a small, recent list.
+        if (typeof outArgs.pageSize === "undefined") outArgs.pageSize = 10;
+        if (!outArgs.orderBy) outArgs.orderBy = "-readingdate";
+      }
+    }
+  }
+
+  return { args: outArgs, debug: { resolvedOs: resolvedOs || "", applied, normalized, dropped: (typeof dropped !== 'undefined' ? dropped : []), schemaObject: (typeof schemaObject !== 'undefined' ? schemaObject : "") } };
+}
+
+// ---------- MCP tools ----------
+function mcpToolsForTenant(tenantId, opts = {}) {
+  const all = opts?.all === true;
+
+  const enabledTools = readEnabledTools(tenantId); // null => everything enabled
+  const isEnabledByAllowlist = (name) => isToolEnabled(tenantId, name, enabledTools);
+
+  const builtins = [
+    {
+      name: "maximo_queryOS",
+      description:
+        "Query a Maximo Object Structure (OS). Returns a table by default. Args: { os?, userText?, columns|select, where, orderBy, pageSize, page, lean, rawResponse, params }. If os is omitted, you may pass userText and the server will resolve OS + filters deterministically (NLQ mode).",
+      isBuiltin: true,
+      enabled: isEnabledByAllowlist("maximo_queryOS"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          os: { type: "string", description: "Maximo Object Structure name, e.g. mxapiwo. Optional if you provide userText." },
+          userText: { type: "string", description: "Natural language query. If provided and os is omitted, the server will resolve os/where/orderBy via NLQ rules." },
+
+          // Preferred (LLM-friendly)
+          columns: { type: "array", items: { type: "string" }, description: "Preferred. List of columns to select, e.g. [\"assetnum\",\"description\",\"status\"]." },
+          select: { type: "string", description: "Comma-separated OSLC select list, e.g. 'assetnum,description,status'." },
+          where: { type: "string", description: "OSLC where clause, e.g. siteid=\"BEDFORD\"." },
+          orderBy: { type: "string", description: "OSLC orderBy, e.g. '-changedate,assetnum'." },
+          pageSize: { type: ["string", "number"], description: "OSLC page size (oslc.pageSize)." },
+          page: { type: ["string", "number"], description: "Page number for paging (maps to Maximo pageno). Default 1." },
+          lean: { type: ["boolean", "string"], description: "If true, adds lean=1 to reduce response envelope." },
+          rawResponse: { type: "boolean", description: "If true, return the raw Maximo JSON instead of projecting to columns/rows." },
+
+          // Backward compatible: arbitrary query params (including oslc.*)
+          params: { type: "object", additionalProperties: { type: "string" } },
+        },
+        // os is optional in NLQ mode
+        required: [],
+      },
+    },
+    {
+      name: "maximo_raw",
+      description: "Raw Maximo request wrapper. Args: { method, path, query, body }. Path is under /maximo/api.",
+      isBuiltin: true,
+      enabled: isEnabledByAllowlist("maximo_raw"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          method: { type: "string" },
+          path: { type: "string" },
+          query: { type: "object", additionalProperties: { type: "string" } },
+          body: {},
+        },
+        required: ["method", "path"],
+      },
+    },
+    {
+      name: "maximo_listAssets",
+      description: "List assets for a site (value list). Args: { site, search?, pageSize? }. Returns { items, table }.",
+      isBuiltin: true,
+      enabled: isEnabledByAllowlist("maximo_listAssets"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          site: { type: "string", description: "Maximo siteid (required)." },
+          search: { type: "string", description: "Optional filter text applied to assetnum/description." },
+          pageSize: { type: ["string", "number"], description: "Max results (default 100)." },
+        },
+        required: ["site"],
+      },
+    },
+    {
+      name: "maximo_createWO",
+      description: "Create a Work Order. Args: { site, assetnum?, priority?, description, fields? }. Returns created identifiers.",
+      isBuiltin: true,
+      enabled: isEnabledByAllowlist("maximo_createWO"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          site: { type: "string" },
+          assetnum: { type: "string" },
+          priority: { type: ["string", "number"] },
+          description: { type: "string" },
+          fields: { type: "object", additionalProperties: true, description: "Optional additional fields for the record body." },
+        },
+        required: ["site", "description"],
+      },
+    },
+    {
+      name: "maximo_createSR",
+      description: "Create a Service Request. Args: { site, assetnum?, priority?, description, fields? }. Returns created identifiers.",
+      isBuiltin: true,
+      enabled: isEnabledByAllowlist("maximo_createSR"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          site: { type: "string" },
+          assetnum: { type: "string" },
+          priority: { type: ["string", "number"] },
+          description: { type: "string" },
+          fields: { type: "object", additionalProperties: true, description: "Optional additional fields for the record body." },
+        },
+        required: ["site", "description"],
+      },
+    },
+  ];
+
+  const savedAll = readSavedTools(tenantId).map((t) => ({
+    name: String(t?.name || ""),
+    description: String(t?.description || (t?.os ? `Saved Maximo query preset (${t.os}).` : "Saved Maximo query preset.")),
+    isBuiltin: false,
+    enabled: (t?.enabled !== false) && isEnabledByAllowlist(String(t?.name || "")),
+    // UI/management fields
+    os: t?.os,
+    select: t?.select,
+    where: t?.where,
+    orderBy: t?.orderBy,
+    pageSize: t?.pageSize,
+    lean: t?.lean,
+    inputSchema: {
+      type: "object",
+      properties: {
+        where: { type: "string", description: "Override oslc.where" },
+        select: { type: "string", description: "Override oslc.select" },
+        columns: { type: "array", items: { type: "string" }, description: "Override columns -> oslc.select" },
+        orderBy: { type: "string", description: "Override oslc.orderBy" },
+        pageSize: { type: ["string", "number"], description: "Override oslc.pageSize" },
+        page: { type: ["string", "number"], description: "Override pageno (1-based)" },
+        lean: { type: ["boolean", "string"], description: "Override lean=1" },
+        rawResponse: { type: "boolean", description: "If true, return raw Maximo JSON" },
+      },
+    },
+  }));
+
+  // What we expose to agents: only callable tools.
+  // What we expose to the UI Tools page: pass all=1 to include disabled tools as well.
+  const saved = all ? savedAll : savedAll.filter((t) => t.enabled === true);
+
+  const combined = [...builtins, ...saved];
+  return all ? combined : combined.filter((t) => t?.enabled === true);
+}
+
+
+app.get("/mcp/tools", (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  const aiProvider = String(req.headers["x-ai-provider"] || "").trim();
+  const aiModel = String(req.headers["x-ai-model"] || "").trim();
+  const aiMeta = (aiProvider || aiModel) ? { aiProvider: aiProvider || undefined, aiModel: aiModel || undefined } : undefined;
+  pushLog({
+    kind: "rx_agent",
+    title: "GET /mcp/tools",
+    method: "GET",
+    path: "/mcp/tools",
+    tenant: tenantId,
+    query: req.query,
+    ...aiMeta,
+  });
+  const all = String(req.query.all || "").trim() === "1" || String(req.query.all || "").toLowerCase() === "true";
+  const tools = mcpToolsForTenant(tenantId, { all });
+  pushLog({
+    kind: "tx_agent",
+    title: "200 /mcp/tools",
+    tenant: tenantId,
+    status: 200,
+    responseBody: clip({ tools }),
+    ...aiMeta,
+  });
+  res.json({ tools });
+});
+
+// List available tenant IDs (no secrets). Useful for UIs and the AI Agent.
+app.get("/mcp/tenants", (_req, res) => {
+  refreshTenants();
+  res.json({ tenants: Object.keys(TENANTS).sort() });
+});
+
+// Tenant info for UI selection (no secrets). Includes baseUrl + defaultSite.
+app.get("/mcp/tenants-info", (_req, res) => {
+  refreshTenants();
+  const tenants = Object.entries(TENANTS).map(([id, t]) => ({
+    id,
+    baseUrl: String(t?.baseUrl || ""),
+    defaultSite: String(t?.defaultSite || ""),
+  })).sort((a,b) => a.id.localeCompare(b.id));
+  res.json({ tenants });
+});
+
+// A small, stable concept catalog that powers the Assistive UI in the AI Agent.
+// This is intentionally "controlled vocabulary" (not tenant-specific metadata).
+// Tenant-specific discovery lives in the NLQ/shape layer and is used when compiling.
+
+// Concepts v2: tenant-aware, discovery-enriched, but controlled. No secrets.
+// NOTE: This endpoint is intentionally NOT protected; it contains no credentials and is used for Assistive UI.
+// Clients still cannot send oslc.where/select/orderBy to MCP tools.
+
+// Concepts v2: tenant-aware, discovery-enriched, but controlled. No secrets.
+// NOTE: This endpoint is intentionally NOT protected; it contains no credentials and is used for Assistive UI.
+// Clients still cannot send oslc.where/select/orderBy to MCP tools.
+
+// Concepts v2: tenant-aware, discovery-enriched, but controlled. No secrets.
+// NOTE: This endpoint is intentionally NOT protected; it contains no credentials and is used for Assistive UI.
+// Clients still cannot send oslc.where/select/orderBy to MCP tools.
+
+// Concepts discovery can be slow for a new tenant because we probe several OS candidates.
+// To avoid proxy 504s and "sticky default" behavior in the Concepts UI, we cache per-tenant
+// results and enforce a short discovery timeout. When discovery times out, we still return
+// a useful catalog (entities + chips) without field enrichment.
+const CONCEPTS_CACHE = new Map(); // tenantId -> { ts, payload }
+const CONCEPTS_CACHE_TTL_MS = Number(process.env.CONCEPTS_CACHE_TTL_MS || 5 * 60 * 1000);
+const CONCEPTS_DISCOVERY_TIMEOUT_MS = Number(process.env.CONCEPTS_DISCOVERY_TIMEOUT_MS || 1200);
+
+function withTimeout(promise, ms) {
+  if (!ms || ms <= 0) return promise;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`discovery timeout after ${ms}ms`)), ms))
+  ]);
+}
+
+async function safeFetchOsFields(args) {
+  try {
+    return await withTimeout(fetchOsFields(args), CONCEPTS_DISCOVERY_TIMEOUT_MS);
+  } catch {
+    return null;
+  }
+}
+
+app.get("/mcp/concepts", (_req, res) => {
+  const tenantId = String(_req.query?.tenant || "default");
+  const overrides = readConceptOverrides(tenantId) || {};
+
+  // Fast path: cached catalog
+  const cached = CONCEPTS_CACHE.get(tenantId);
+  if (cached && (Date.now() - cached.ts) < CONCEPTS_CACHE_TTL_MS) {
+    return res.json(cached.payload);
+  }
+
+  const ENTITY_CANDIDATES = [
+    { entity: "work_order", label: "Work Orders", osCandidates: ["mxapiwo"] },
+    { entity: "service_request", label: "Service Requests", osCandidates: ["mxapisr"] },
+    { entity: "asset", label: "Assets", osCandidates: ["mxapiasset"] },
+    { entity: "location", label: "Locations", osCandidates: ["mxapilocations"] },
+    { entity: "pm", label: "Preventive Maintenance", osCandidates: ["mxapipm"] },
+    { entity: "meter_reading", label: "Meter Readings", osCandidates: ["mxapimeasurementcbm", "mxapiassetmeter"] },
+    { entity: "job_plan", label: "Job Plans", osCandidates: ["mxapijobplan"] },
+    { entity: "po", label: "Purchase Orders", osCandidates: ["mxapipo"] },
+    { entity: "pr", label: "Purchase Requisitions", osCandidates: ["mxapipr"] },
+    { entity: "inventory", label: "Inventory", osCandidates: ["mxapiinventory"] },
+    { entity: "insp_form", label: "Inspection Forms", osCandidates: ["mxapiinspform"] },
+  ];
+
+  // Tenant-maintained additions (controlled). Allow adding more entity phrases/OS names.
+  if (Array.isArray(overrides.entities)) {
+    for (const e of overrides.entities) {
+      const label = String(e?.label || "").trim();
+      // UI allows adding entities without knowing the internal entity id.
+      // Infer entity from OS candidate if possible; otherwise slugify from label.
+      const osCandidates = Array.isArray(e?.osCandidates) ? e.osCandidates.map(String) : [];
+      if (!label || !osCandidates.length) continue;
+
+      let entity = String(e?.entity || "").trim();
+      if (!entity) {
+        const firstOs = String(osCandidates[0] || "").toLowerCase();
+        const known = ENTITY_CANDIDATES.find(x => (x.osCandidates || []).some(o => String(o).toLowerCase() === firstOs));
+        if (known?.entity) entity = known.entity;
+      }
+      if (!entity) {
+        entity = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      }
+
+      ENTITY_CANDIDATES.push({ entity, label, osCandidates });
+    }
+  }
+
+  (async () => {
+    const t = tenantOrThrow(tenantId, requestOrigin(_req));
+
+    const entities = [];
+    for (const e of ENTITY_CANDIDATES) {
+      let chosenOs = null;
+      let fields = null;
+
+      for (const os of e.osCandidates) {
+        try {
+          const f = await safeFetchOsFields({ tenantId, t, os });
+          if (f && f.size) { chosenOs = os; fields = f; break; }
+        } catch { /* best-effort */ }
+      }
+      // If discovery fails, still emit the concept (with minimal capabilities)
+      // so the UI can show useful, controlled suggestions.
+      if (!chosenOs) chosenOs = e.osCandidates[0] || null;
+      if (!fields) fields = new Set();
+      if (!chosenOs) continue;
+
+      const has = (name) => fields.has(name);
+      const pickFirst = (prefs) => {
+        for (const p of prefs) if (has(p)) return p;
+        return null;
+      };
+
+      const idField =
+        (e.entity === "work_order") ? pickFirst(["wonum", "workorderid", "workorderuid", "ticketid"]) :
+        (e.entity === "service_request") ? pickFirst(["ticketid", "ticketuid", "srid", "srnum"]) :
+        (e.entity === "asset") ? pickFirst(["assetnum", "assetid"]) :
+        (e.entity === "location") ? pickFirst(["location", "locationid"]) :
+        (e.entity === "pm") ? pickFirst(["pmnum", "pmid"]) :
+        pickFirst(["id", "uid"]);
+
+      const recencyField = pickFirst(["changedate", "reportdate", "createdate", "statusdate"]) || idField || null;
+
+      const supportedFilters = [];
+      if (has("status")) supportedFilters.push("status_state", "status_code");
+      if (has("siteid")) supportedFilters.push("site");
+      if (has("orgid")) supportedFilters.push("org");
+      if (has("assetnum")) supportedFilters.push("asset_id");
+      if (has("location")) supportedFilters.push("location_id");
+      supportedFilters.push("text_search");
+      supportedFilters.push("date_range");
+
+      const supportedSort = [];
+      if (recencyField) supportedSort.push("recency");
+      if (idField) supportedSort.push("id_desc");
+      if (has("priority")) supportedSort.push("priority");
+
+      const statusMapping = has("status") ? {
+        approved: "APPR",
+        pending_approval: "WAPPR",
+        completed: "COMP",
+        closed: "CLOSE",
+        in_progress: "INPROG"
+      } : null;
+
+      entities.push({
+        entity: e.entity,
+        label: e.label,
+        osCandidates: [chosenOs],
+        fields: {
+          ...(idField ? { id: { concept: "id", label: "Identifier", kind: "id", maximoField: idField } } : {}),
+          ...(has("status") ? { status: { concept: "status", label: "Status", kind: "enum", maximoField: "status" } } : {}),
+          ...(recencyField ? { recency: { concept: "recency", label: "Most recent", kind: "sort", maximoField: recencyField } } : {}),
+        },
+        supportedConcepts: {
+          filters: supportedFilters,
+          sort: supportedSort,
+          aggregations: ["count"]
+        },
+        ...(statusMapping ? { statusMapping } : {})
+      });
+    }
+
+    const chips = [];
+    const wo = entities.find(x => x.entity === "work_order");
+    if (wo) {
+      if ((wo.supportedConcepts?.filters || []).includes("status_state")) {
+        chips.push({ group: wo.label, text: "approved work orders", intentHint: { entity: "work_order", filters: [{ concept: "status_state", value: "approved" }] } });
+        chips.push({ group: wo.label, text: "pending approval work orders", intentHint: { entity: "work_order", filters: [{ concept: "status_state", value: "pending_approval" }] } });
+        chips.push({ group: wo.label, text: "closed work orders", intentHint: { entity: "work_order", filters: [{ concept: "status_state", value: "closed" }] } });
+      }
+      chips.push({ group: wo.label, text: "top 10 most recent work orders", intentHint: { entity: "work_order", result: { limit: 10 }, sort: [{ concept: "recency", direction: "desc" }] } });
+      chips.push({ group: wo.label, text: "work orders for assets of type SENSOR", intentHint: { entity: "work_order", filters: [{ concept: "related_filter", relation: "asset", filters: [{ concept: "asset_type", value: "SENSOR" }] }] } });
+      chips.push({ group: wo.label, text: "count open work orders (by status & work type)", intentHint: { entity: "work_order", filters: [{ concept: "status_state", value: "open" }], result: { kind: "aggregate", groupBy: ["status","worktype"] } } });
+    }
+
+    const mr = entities.find(x => x.entity === "meter_reading");
+    if (mr) {
+      chips.push({
+        group: mr.label,
+        text: "last meter readings for asset BK1000001",
+        intentHint: {
+          entity: "meter_reading",
+          filters: [{ concept: "asset_id", value: "BK1000001" }],
+          result: { limit: 10 },
+          sort: [{ concept: "recency", direction: "desc" }]
+        }
+      });
+    }
+
+    const legacy = {
+      entities: entities.map(e => ({ id: e.entity, label: e.label, example: String(e.label || '').toLowerCase() })),
+      statusPhrases: [
+        { label: "Approved", text: "approved" },
+        { label: "Pending approval", text: "pending approval" },
+        { label: "Closed", text: "closed" },
+        { label: "In progress", text: "in progress" }
+      ],
+      quickPhrases: [
+        { label: "Top 10", text: "top 10" },
+        { label: "Latest", text: "latest" },
+        { label: "Count", text: "count" },
+        { label: "This site", text: "in my site" }
+      ]
+    };
+
+    // Apply tenant overrides (controlled UI). These do not affect the compiler directly,
+    // but they feed suggestions + help OS resolution via NLQ rules elsewhere.
+    const mergeByLabel = (baseArr, extraArr) => {
+      const out = Array.isArray(baseArr) ? [...baseArr] : [];
+      const seen = new Set(out.map(x => String(x?.label || x?.id || '').toLowerCase()).filter(Boolean));
+      for (const x of (Array.isArray(extraArr) ? extraArr : [])) {
+        const key = String(x?.label || x?.id || '').toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(x);
+      }
+      return out;
+    };
+    if (overrides) {
+      legacy.entities = mergeByLabel(legacy.entities, (overrides.entities || []).map(e => ({
+        id: String(e?.id || e?.entity || e?.label || '').toLowerCase(),
+        label: String(e?.label || e?.entity || ''),
+        example: String(e?.example || e?.label || '').toLowerCase()
+      })));
+      legacy.statusPhrases = mergeByLabel(legacy.statusPhrases, overrides.statusPhrases);
+      legacy.quickPhrases = mergeByLabel(legacy.quickPhrases, overrides.quickPhrases);
+    }
+
+    const payload = {
+      version: 2,
+      tenant: tenantId,
+      generatedAt: new Date().toISOString(),
+      entities,
+      ui: { chips },
+      legacy
+    };
+    CONCEPTS_CACHE.set(tenantId, { ts: Date.now(), payload });
+    return res.json(payload);
+  })().catch((e) => {
+    const payload = {
+      version: 2,
+      tenant: tenantId,
+      generatedAt: new Date().toISOString(),
+      entities: [],
+      ui: { chips: [] },
+      legacy: {
+        entities: [
+          { id: "work_order", label: "Work Orders", example: "work orders" },
+          { id: "service_request", label: "Service Requests", example: "service requests" },
+          { id: "asset", label: "Assets", example: "assets" },
+          { id: "location", label: "Locations", example: "locations" }
+        ],
+        statusPhrases: [
+          { label: "Approved", text: "approved" },
+          { label: "Closed", text: "closed" }
+        ],
+        quickPhrases: [
+          { label: "Top 10", text: "top 10" },
+          { label: "Count", text: "count" }
+        ]
+      },
+      _error: String(e?.message || e)
+    };
+    // Cache the fallback briefly to avoid repeated slow failures hammering the proxy.
+    CONCEPTS_CACHE.set(tenantId, { ts: Date.now(), payload });
+    return res.json(payload);
+  });
+
+
+// Deterministic intent execution (no LLM): compile an intentHint into a validated OSLC query and execute it.
+// This powers Maximo Mode execution from Assistive UI chips and other structured callers.
+app.post("/mcp/intent/query", requireAuth(), async (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const userText = String(req.body?.userText || "");
+  const intentHint = req.body?.intentHint || null;
+  const defaultSite = String(req.body?.defaultSite || "").trim().toUpperCase();
+  const aiProvider = String(req.headers["x-ai-provider"] || "").trim();
+  const aiModel = String(req.headers["x-ai-model"] || "").trim();
+  const aiMeta = (aiProvider || aiModel) ? { aiProvider: aiProvider || undefined, aiModel: aiModel || undefined } : undefined;
+
+  const rxId = pushLog({
+    kind: "rx_agent",
+    title: "POST /mcp/intent/query",
+    method: "POST",
+    path: "/mcp/intent/query",
+    tenant: tenantId,
+    args: clip({ userText, intentHint, defaultSite }),
+    ...aiMeta,
+  });
+
+  try {
+    if (!intentHint || typeof intentHint !== "object") {
+      return res.status(400).json({ error: "bad_request", detail: "intentHint (object) is required" });
+    }
+
+    const t = tenantOrThrow(tenantId, requestOrigin(req));
+
+    // 1) Load tenant-aware concept catalog (controlled, discovery-enriched)
+    //    We reuse the same logic as GET /mcp/concepts (no secrets).
+    const conceptsResp = await (async () => {
+      // call the same builder inline by reusing the GET handler implementation structure
+      // (kept as best-effort; if discovery fails we still allow minimal execution)
+      const ENTITY_CANDIDATES = [
+        { entity: "work_order", label: "Work Orders", osCandidates: ["mxapiwo"] },
+        { entity: "service_request", label: "Service Requests", osCandidates: ["mxapisr"] },
+        { entity: "asset", label: "Assets", osCandidates: ["mxapiasset"] },
+        { entity: "location", label: "Locations", osCandidates: ["mxapilocations"] },
+        { entity: "pm", label: "Preventive Maintenance", osCandidates: ["mxapipm"] },
+    { entity: "job_plan", label: "Job Plans", osCandidates: ["mxapijobplan"] },
+    { entity: "po", label: "Purchase Orders", osCandidates: ["mxapipo"] },
+    { entity: "pr", label: "Purchase Requisitions", osCandidates: ["mxapipr"] },
+    { entity: "inventory", label: "Inventory", osCandidates: ["mxapiinventory"] },
+    { entity: "inspection_form", label: "Inspection Forms", osCandidates: ["mxapiinspform"] },
+        { entity: "meter_reading", label: "Meter Readings", osCandidates: ["mxapimeasurementcbm", "mxapiassetmeter"] },
+      ];
+
+  // Tenant-added controlled concepts (operator-maintained). These still go through
+  // the same discovery/enrichment, and if an OS can't be resolved we simply omit it.
+  if (Array.isArray(overrides.entities)) {
+    for (const e of overrides.entities) {
+      const entity = String(e?.entity || e?.id || "").trim();
+      const label = String(e?.label || entity).trim();
+      const osCandidates = Array.isArray(e?.osCandidates) ? e.osCandidates.map(String) : (e?.os ? [String(e.os)] : []);
+      if (!entity || !label || !osCandidates.length) continue;
+      ENTITY_CANDIDATES.push({ entity, label, osCandidates });
+    }
+  }
+
+      const entities = [];
+      for (const e of ENTITY_CANDIDATES) {
+        let chosenOs = null;
+        let fields = null;
+
+        for (const os of e.osCandidates) {
+          try {
+            const f = await safeFetchOsFields({ tenantId, t, os });
+            if (f && f.size) { chosenOs = os; fields = f; break; }
+          } catch { /* best-effort */ }
+        }
+        // If discovery fails, keep the entity with minimal capabilities.
+        if (!chosenOs) chosenOs = e.osCandidates[0] || null;
+        if (!fields) fields = new Set();
+        if (!chosenOs) continue;
+
+        const has = (name) => fields.has(name);
+        const pickFirst = (prefs) => {
+          for (const p of prefs) if (has(p)) return p;
+          return null;
+        };
+
+        const idField =
+          (e.entity === "work_order") ? pickFirst(["wonum", "workorderid", "workorderuid", "ticketid"]) :
+          (e.entity === "service_request") ? pickFirst(["ticketid", "ticketuid", "srid", "srnum"]) :
+          (e.entity === "asset") ? pickFirst(["assetnum", "assetid"]) :
+          (e.entity === "location") ? pickFirst(["location", "locationid"]) :
+          (e.entity === "pm") ? pickFirst(["pmnum", "pmid"]) :
+          pickFirst(["id", "uid"]);
+
+        const recencyField = pickFirst(["changedate", "reportdate", "createdate", "statusdate"]) || idField || null;
+
+        const supportedFilters = [];
+        if (has("status")) supportedFilters.push("status_state", "status_code");
+        if (has("siteid")) supportedFilters.push("site");
+        if (has("orgid")) supportedFilters.push("org");
+        if (has("assetnum")) supportedFilters.push("asset_id");
+        if (has("location")) supportedFilters.push("location_id");
+        supportedFilters.push("text_search");
+        supportedFilters.push("date_range");
+
+        const supportedSort = [];
+        if (recencyField) supportedSort.push("recency");
+        if (idField) supportedSort.push("id_desc");
+        if (has("priority")) supportedSort.push("priority");
+
+        const statusMapping = has("status") ? {
+          approved: "APPR",
+          pending_approval: "WAPPR",
+          completed: "COMP",
+          closed: "CLOSE",
+          in_progress: "INPROG"
+        } : null;
+
+        entities.push({
+          entity: e.entity,
+          label: e.label,
+          osCandidates: [chosenOs],
+          _discoveredFields: Array.from(fields.values()),
+          fields: {
+            ...(idField ? { id: { concept: "id", label: "Identifier", kind: "id", maximoField: idField } } : {}),
+            ...(has("status") ? { status: { concept: "status", label: "Status", kind: "enum", maximoField: "status" } } : {}),
+            ...(recencyField ? { recency: { concept: "recency", label: "Most recent", kind: "sort", maximoField: recencyField } } : {}),
+            ...(has("siteid") ? { site: { concept: "site", label: "Site", kind: "id", maximoField: "siteid" } } : {}),
+            ...(has("assetnum") ? { asset_id: { concept: "asset_id", label: "Asset", kind: "id", maximoField: "assetnum" } } : {}),
+            ...(has("location") ? { location_id: { concept: "location_id", label: "Location", kind: "id", maximoField: "location" } } : {}),
+          },
+          supportedConcepts: {
+            filters: supportedFilters,
+            sort: supportedSort,
+            aggregations: ["count"],
+            ...(statusMapping ? { statusMapping } : {})
+          }
+        });
+      }
+
+      return { version: 2, tenant: tenantId, entities };
+    })();
+
+    const entityId = String(intentHint?.entity || "").trim();
+    const entity = (conceptsResp.entities || []).find((e) => String(e?.entity) === entityId) || null;
+    if (!entity) {
+      return res.status(400).json({ error: "unknown_entity", detail: `Unknown entity '${entityId}'.`, entities: (conceptsResp.entities||[]).map(e=>e.entity) });
+    }
+
+    const os = String(entity?.osCandidates?.[0] || "").trim();
+    if (!os) return res.status(400).json({ error: "no_os", detail: `No OS resolved for entity '${entityId}'.` });
+    const quote = (v) => `"${String(v ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
+    // Relationship discovery (tenant-aware, best-effort from OAS)
+    const rels = await fetchOsRelations({ tenantId, t, os }).catch(() => new Map());
+    const getRel = (name) => {
+      const key = String(name || "").trim().toLowerCase();
+      if (!key) return null;
+      if (rels?.get) {
+        if (rels.has(key)) return rels.get(key);
+        // fuzzy: contains
+        for (const [k, v] of rels.entries()) {
+          if (k === key) return v;
+          if (k.includes(key) || key.includes(k)) return v;
+        }
+      }
+      return null;
+    };
+
+    // 2) Build WHERE (validated fields only)
+    const whereParts = [];
+
+    const siteField = entity?.fields?.site?.maximoField || (entity?._discoveredFields||[]).some(f=>String(f).toLowerCase()==='siteid') ? 'siteid' : null;
+    if (defaultSite && siteField) {
+      whereParts.push(`${siteField}=${quote(defaultSite)}`);
+    }
+
+    const filters = Array.isArray(intentHint?.filters) ? intentHint.filters : [];
+    // Some relationship filters cannot be expressed safely in Maximo OSLC (dot-notation often fails to parse
+    // on /api/os endpoints). We compile these as a two-step query:
+    //  1) query the related OS to obtain ids
+    //  2) apply an IN (...) filter on the primary OS.
+    let pendingRelatedFilter = null; // { relation: 'asset', inner: [{concept,value}] }
+    for (const f of filters) {
+      const concept = String(f?.concept || "").trim();
+      const value = f?.value;
+      if (!concept) continue;
+
+      if (concept === "status_state") {
+        const map = entity?.supportedConcepts?.statusMapping || {};
+        const state = String(value || "").trim();
+        if (state.toLowerCase() === "open") {
+          whereParts.push(`status!=${quote("CLOSE")}`);
+          whereParts.push(`status!=${quote("COMP")}`);
+          continue;
+        }
+        const code = map[state] || map[state.toLowerCase()] || null;
+        if (code) whereParts.push(`status=${quote(code)}`);
+        continue;
+      }
+      if (concept === "status_code") {
+        const v = String(value || "").trim();
+        if (v) whereParts.push(`status=${quote(v)}`);
+        continue;
+      }
+      if (concept === "asset_id") {
+        const fld = entity?.fields?.asset_id?.maximoField || null;
+        const v = String(value || "").trim();
+        if (fld && v) whereParts.push(`${fld}=${quote(v)}`);
+        continue;
+      }
+      if (concept === "location_id") {
+        const fld = entity?.fields?.location_id?.maximoField || null;
+        const v = String(value || "").trim();
+        if (fld && v) whereParts.push(`${fld}=${quote(v)}`);
+        continue;
+      }
+      if (concept === "site") {
+        const v = String(value || "").trim().toUpperCase();
+        if (siteField && v) whereParts.push(`${siteField}=${quote(v)}`);
+        continue;
+      }
+
+      if (concept === "related_filter") {
+        const relNameIn = String(f?.relation || "").trim();
+        const inner = Array.isArray(f?.filters) ? f.filters : [];
+        if (!relNameIn || !inner.length) continue;
+        pendingRelatedFilter = { relation: relNameIn, inner };
+        continue;
+      }
+      // other concepts are ignored in v1 of intent execution
+    }
+
+    let where = whereParts.filter(Boolean).join(" and ") || "";
+
+    // 3) Select fields (validated) + orderBy
+    const idField = entity?.fields?.id?.maximoField || null;
+    const statusField = entity?.fields?.status?.maximoField || null;
+    const recencyField = entity?.fields?.recency?.maximoField || null;
+
+    const resultKind = String(intentHint?.result?.kind || "list").trim().toLowerCase();
+    const requested = Array.isArray(intentHint?.result?.fields) ? intentHint.result.fields : [];
+    const selectSet = new Set();
+    const add = (f) => { if (f) selectSet.add(String(f)); };
+
+    // always include id
+    add(idField);
+    // include common
+    add(statusField);
+    add(recencyField);
+
+    for (const rf of requested) {
+      const c = String(rf || "").trim();
+      if (!c) continue;
+      const mapped = entity?.fields?.[c]?.maximoField || null;
+      if (mapped) add(mapped);
+    }
+
+    // Relationship list request (e.g. asset -> meterreading)
+    let relatedList = null; // { relName, fields: string[] }
+    if (resultKind === "related_list") {
+      const relNameReq = String(intentHint?.result?.relation || "").trim();
+      const rel = getRel(relNameReq);
+      if (rel) {
+        // pick a compact set of useful fields from the related schema
+        const pick = (prefs) => {
+          const out = [];
+          for (const p of prefs) if (rel.fields?.has(p)) out.push(p);
+          return out;
+        };
+        const relFields = pick(["metername","meter","meternum","description","reading","newreading","readingdate","measureunitid","changedate","recorddate","linenum"]);
+        if (!relFields.length) relFields.push(...Array.from(rel.fields || []).slice(0, 8));
+        relatedList = { relName: rel.name, fields: relFields };
+        // add nested select using OSLC brace syntax
+        add(`${rel.name}{${relFields.join(",")}}`);
+      }
+    }
+
+    // fall back to a small useful set if nothing resolved
+    if (!selectSet.size) {
+      add(idField || "wonum");
+      add("description");
+      if (statusField) add(statusField);
+      if (siteField) add(siteField);
+    }
+
+    const select = Array.from(selectSet).join(",");
+
+    let orderBy = "";
+    const sort = Array.isArray(intentHint?.sort) ? intentHint.sort : [];
+    const s0 = sort[0] || null;
+    if (s0 && String(s0?.concept || "") === "recency" && recencyField) {
+      const dir = String(s0?.direction || "desc").toLowerCase();
+      orderBy = (dir === "asc" ? "+" : "-") + recencyField;
+    } else if (recencyField) {
+      orderBy = "-" + recencyField;
+    } else if (idField) {
+      orderBy = "-" + idField;
+    }
+
+    const rk = String(resultKind || "list").trim().toLowerCase();
+    const limit = Number(intentHint?.result?.limit || intentHint?.limit || (rk === "aggregate" ? 1 : 50));
+    const MAX_PAGE_SIZE = Number(process.env.MAX_PAGE_SIZE || 2000);
+    const pageSize = (rk === "related_list") ? "1" : ((Number.isFinite(limit) && limit > 0) ? String((Number.isFinite(MAX_PAGE_SIZE) && MAX_PAGE_SIZE > 0) ? Math.min(MAX_PAGE_SIZE, Math.max(1, limit)) : Math.max(1, limit)) : "50");
+
+    // 4) Execute OS call (no LLM)
+    const api = maximoApiBase(t, req);
+    const headers = authHeaders(t);
+
+    const doFetch = async (qs) => {
+      const url = `${api}/os/${encodeURIComponent(os)}?${qs.toString()}`;
+      return await maximoFetch(t, {
+        method: "GET",
+        url,
+        headers,
+        kind: "tx_maximo",
+        title: `→ Maximo intent ${entityId} (${os})`,
+        meta: { tool: "intent_query", relatedId: rxId, ...(aiMeta || {}) }
+      });
+    };
+
+    // Resolve pending relationship filter via a safe two-step query.
+    // This avoids dot-notation in oslc.where which frequently fails parsing on /api/os.
+    const resolveRelatedFilter = async () => {
+      if (!pendingRelatedFilter) return;
+
+      const relName = String(pendingRelatedFilter.relation || "").trim().toLowerCase();
+      if (relName !== "asset") return; // v1 only supports asset relationship expansion
+
+      // We can only apply this to entities that have an assetnum-like field.
+      const assetField = (entity?._discoveredFields || []).find(f => String(f).toLowerCase() === "assetnum") || null;
+      if (!assetField) return;
+
+      // Compile the inner filter to the related OS (assets)
+      const inner = Array.isArray(pendingRelatedFilter.inner) ? pendingRelatedFilter.inner : [];
+      const desiredAssetType = inner.find(x => String(x?.concept || "") === "asset_type")?.value;
+      const v = String(desiredAssetType || "").trim();
+      if (!v) return;
+
+      const assetsOs = "mxapiasset";
+      const qs = new URLSearchParams();
+      const whereA = [];
+      if (defaultSite) whereA.push(`siteid=${quote(defaultSite)}`);
+      whereA.push(`assettype=${quote(v)}`);
+      qs.set("oslc.where", whereA.join(" and "));
+      qs.set("oslc.select", "assetnum,assettype");
+      qs.set("oslc.pageSize", "200");
+      qs.set("lean", "1");
+
+      const urlA = `${api}/os/${encodeURIComponent(assetsOs)}?${qs.toString()}`;
+      const { r: rA, respText: tA } = await maximoFetch(t, {
+        method: "GET",
+        url: urlA,
+        headers,
+        kind: "tx_maximo",
+        title: `→ Maximo intent related ${entityId} (assettype)` ,
+        meta: { tool: "intent_query_related", relatedId: rxId, ...(aiMeta || {}) }
+      });
+      const ctA = (rA.headers.get("content-type") || "").toLowerCase();
+      const bodyA = ctA.includes("application/json") ? (safeJson(tA) ?? { raw: tA }) : { raw: tA };
+      if (!rA.ok) {
+        // If the related filter cannot be resolved, fall back to the base WHERE (site-only)
+        pushLog({ kind: "tx_agent", title: "Error related filter prefetch", tenant: tenantId, status: rA.status, relatedId: rxId, responseBody: clip(bodyA), ...aiMeta });
+        return;
+      }
+      const members = bodyA?.member || bodyA?.["rdfs:member"] || [];
+      const assetnums = Array.isArray(members) ? members.map(m => String(m?.assetnum || "").trim()).filter(Boolean) : [];
+      if (!assetnums.length) {
+        // Force no results in a parser-friendly way
+        where = [where, `${assetField}=${quote("__NO_MATCH__")}`].filter(Boolean).join(" and ");
+        return;
+      }
+      // Safer than IN (...) for Maximo parsers: build an OR chain.
+      const ors = assetnums.slice(0, 200).map(a => `${assetField}=${quote(a)}`);
+      const clause = `(${ors.join(" or ")})`;
+      where = [where, clause].filter(Boolean).join(" and ");
+    };
+
+    await resolveRelatedFilter();
+
+    // Special result kinds
+    // A) related_list: fetch root entity, then extract relationship list from first record and post-process
+    if (resultKind === "related_list") {
+      const relNameIn = String(intentHint?.result?.relation || "").trim();
+
+      // Special-case (high reliability): Asset → meter readings.
+      // Nested OSLC select on /api/os is inconsistent across MAS versions/tenants and frequently breaks parsing.
+      // Instead, query the meter-reading OS directly.
+      if (String(entityId) === "asset" && /meter/i.test(relNameIn)) {
+        const assetnum = (where.match(/assetnum\s*=\s*\"([^\"]+)\"/i) || [])[1] || (where.match(/assetnum\s*=\s*'([^']+)'/i) || [])[1] || "";
+        if (!assetnum) {
+          return res.status(400).json({ error: "missing_assetnum", detail: "Cannot resolve assetnum for meter reading query." });
+        }
+        // Preferred: meter reading history
+        // - mxapimeasurementcbm: persistent CBM measurement events
+        // - fallback: mxapiassetmeter (definitions / last readings)
+        const mrOs = "mxapimeasurementcbm";
+        const qsMr = new URLSearchParams();
+        const whereMr = [];
+        if (defaultSite) whereMr.push(`siteid=${quote(defaultSite)}`);
+        whereMr.push(`assetnum=${quote(assetnum)}`);
+        qsMr.set("oslc.where", whereMr.join(" and "));
+        qsMr.set("oslc.select", "assetnum,metername,meternum,reading,newreading,readingdate,measureunitid,changedate,recorddate");
+        qsMr.set("oslc.orderBy", "-readingdate");
+        qsMr.set("oslc.pageSize", String(Math.min(200, Math.max(1, Number(limit || 10)))));
+        qsMr.set("lean", "1");
+        const urlMr = `${api}/os/${encodeURIComponent(mrOs)}?${qsMr.toString()}`;
+        const { r: rMr, respText: tMr } = await maximoFetch(t, {
+          method: "GET",
+          url: urlMr,
+          headers,
+          kind: "tx_maximo",
+          title: `→ Maximo intent meter readings (${mrOs})`,
+          meta: { tool: "intent_query", relatedId: rxId, ...(aiMeta || {}) }
+        });
+        const ctMr = (rMr.headers.get("content-type") || "").toLowerCase();
+        const bodyMr = ctMr.includes("application/json") ? (safeJson(tMr) ?? { raw: tMr }) : { raw: tMr };
+        if (!rMr.ok) {
+          pushLog({ kind: "tx_agent", title: "Error /mcp/intent/query", tenant: tenantId, status: rMr.status, relatedId: rxId, responseBody: clip(bodyMr), ...aiMeta });
+          return res.status(rMr.status).json(bodyMr);
+        }
+        const members = bodyMr?.member || bodyMr?.["rdfs:member"] || [];
+        const arr = Array.isArray(members) ? members : [];
+        const cols = ["assetnum","metername","meternum","reading","newreading","readingdate","measureunitid","changedate","recorddate"];
+        const rows = arr.slice(0, Math.min(cols.length ? (limit || 10) : 10, arr.length)).map(o => cols.map(c => o?.[c] ?? ""));
+        const table = { columns: cols, rows };
+        const summary = `Found ${arr.length} meter readings for asset ${assetnum}`;
+        const trace = { compiled: { entity: "meter_reading", os: mrOs, where: qsMr.get("oslc.where"), select: qsMr.get("oslc.select"), orderBy: qsMr.get("oslc.orderBy"), pageSize: qsMr.get("oslc.pageSize") }, intentHint, userText };
+        pushLog({ kind: "tx_agent", title: "200 /mcp/intent/query", tenant: tenantId, status: 200, relatedId: rxId, responseBody: clip({ summary, compiled: trace.compiled }) });
+        return res.json({ ok: true, summary, table, trace });
+      }
+
+      const rel = getRel(relNameIn);
+      if (!rel) {
+        return res.status(400).json({ error: "unknown_relation", detail: `Relation '${relNameIn}' not found for OS '${os}'.` });
+      }
+      // Choose a compact but useful nested select based on discovered fields
+      const preferred = ["metername", "reading", "newreading", "readingdate", "recorddate", "changedate", "measureunitid", "linenum", "remarks"];
+      const relCols = preferred.filter(f => rel.fields?.has?.(f));
+      const nested = relCols.length ? `${rel.name}{${relCols.join(",")}}` : rel.name;
+      const qs = new URLSearchParams();
+      if (where) qs.set("oslc.where", where);
+      qs.set("oslc.select", [idField, nested].filter(Boolean).join(","));
+      qs.set("oslc.pageSize", "1");
+      qs.set("lean", "1");
+
+      const { r, respText } = await doFetch(qs);
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const bodyRaw = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+      if (!r.ok) {
+        pushLog({ kind: "tx_agent", title: "Error /mcp/intent/query", tenant: tenantId, status: r.status, relatedId: rxId, responseBody: clip(bodyRaw), ...aiMeta });
+        return res.status(r.status).json(bodyRaw);
+      }
+      const root = bodyRaw?.member?.[0] || bodyRaw?.["rdfs:member"]?.[0] || null;
+      const relArr = root?.[rel.name] || root?.[String(rel.name).toLowerCase()] || [];
+      const arr = Array.isArray(relArr) ? relArr : (relArr ? [relArr] : []);
+      // Sort by best date-like field if present
+      const dateField = ["readingdate", "recorddate", "changedate"].find(f => relCols.includes(f)) || null;
+      const sorted = dateField ? arr.slice().sort((a,b) => String(b?.[dateField]||"").localeCompare(String(a?.[dateField]||""))) : arr;
+      const out = sorted.slice(0, Math.min(limit || 10, sorted.length));
+      const cols = relCols.length ? relCols : Object.keys(out?.[0] || {});
+      const table = { columns: cols, rows: out.map(o => cols.map(c => o?.[c] ?? "")) };
+
+      const summary = `Extracted ${out.length} ${rel.name} records for ${entity?.label || entityId}`;
+      const trace = { compiled: { entity: entityId, os, where, select: qs.get("oslc.select"), orderBy: "", pageSize: "1" }, intentHint, userText };
+      pushLog({ kind: "tx_agent", title: "200 /mcp/intent/query", tenant: tenantId, status: 200, relatedId: rxId, responseBody: clip({ summary, compiled: trace.compiled }) });
+      return res.json({ ok: true, summary, table, trace });
+    }
+
+    // B) aggregate: return narrative count (optionally grouped)
+    if (resultKind === "aggregate") {
+      const groupBy = Array.isArray(intentHint?.result?.groupBy) ? intentHint.result.groupBy : [];
+      const gb = groupBy.map(x => String(x||"").trim()).filter(Boolean);
+      // Map known concepts to fields
+      const gbFields = gb.map(g => {
+        if (g === "status") return "status";
+        if (g === "worktype") return "worktype";
+        const mapped = entity?.fields?.[g]?.maximoField || null;
+        return mapped;
+      }).filter(Boolean);
+
+      const colsAgg = Array.from(new Set([...(gbFields), ...(entity?._discoveredFields||[]).includes("status") ? ["status"] : []].filter(Boolean)));
+      const qs = new URLSearchParams();
+      if (where) qs.set("oslc.where", where);
+      qs.set("oslc.select", colsAgg.join(","));
+      qs.set("oslc.pageSize", "200");
+      qs.set("lean", "1");
+
+      // Page through a bounded amount to avoid runaway
+      let page = 1;
+      const maxRows = 5000;
+      const rows = [];
+      while (rows.length < maxRows) {
+        qs.set("pageno", String(page));
+        const { r, respText } = await doFetch(qs);
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        const bodyRaw = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+        if (!r.ok) {
+          pushLog({ kind: "tx_agent", title: "Error /mcp/intent/query", tenant: tenantId, status: r.status, relatedId: rxId, responseBody: clip(bodyRaw), ...aiMeta });
+          return res.status(r.status).json(bodyRaw);
+        }
+        const members = bodyRaw?.member || bodyRaw?.["rdfs:member"] || [];
+        if (!Array.isArray(members) || members.length === 0) break;
+        for (const m of members) {
+          if (rows.length >= maxRows) break;
+          rows.push(m);
+        }
+        if (members.length < 200) break;
+        page += 1;
+      }
+
+      const total = rows.length;
+      const breakdown = new Map();
+      if (gbFields.length) {
+        for (const m of rows) {
+          const key = gbFields.map(f => String(m?.[f] ?? "")).join(" | ");
+          breakdown.set(key, (breakdown.get(key) || 0) + 1);
+        }
+      }
+      const top = Array.from(breakdown.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 25);
+      const detail = gbFields.length ? top.map(([k,v]) => ({ group: k, count: v })) : [];
+      const summary = gbFields.length
+        ? `There are ${total} matching ${entity?.label || entityId}, grouped by ${gb.join(", ")}.`
+        : `There are ${total} matching ${entity?.label || entityId}.`;
+
+      const trace = { compiled: { entity: entityId, os, where, select: qs.get("oslc.select"), orderBy: "", pageSize: qs.get("oslc.pageSize") }, intentHint, userText };
+      pushLog({ kind: "tx_agent", title: "200 /mcp/intent/query", tenant: tenantId, status: 200, relatedId: rxId, responseBody: clip({ summary, compiled: trace.compiled, detailCount: detail.length }) });
+      return res.json({ ok: true, summary, detail, trace });
+    }
+
+    // Default list execution
+    const qs = new URLSearchParams();
+    if (where) qs.set("oslc.where", where);
+    if (select) qs.set("oslc.select", select);
+    if (orderBy) qs.set("oslc.orderBy", orderBy);
+    qs.set("oslc.pageSize", pageSize);
+    qs.set("lean", "1");
+
+    const { r, respText } = await doFetch(qs);
+
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    const bodyRaw = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+
+    if (!r.ok) {
+      pushLog({ kind: "tx_agent", title: "Error /mcp/intent/query", tenant: tenantId, status: r.status, relatedId: rxId, responseBody: clip(bodyRaw), ...aiMeta });
+      return res.status(r.status).json(bodyRaw);
+    }
+
+    const cols = select.split(",").map(x=>x.trim()).filter(Boolean);
+    const projected = projectOslcResponseToTable(os, bodyRaw, cols, { pageSize: Number(pageSize), page: 1 });
+
+    const summary = `Executed ${entity?.label || entityId} (${os})`;
+    const trace = {
+      compiled: { entity: entityId, os, where, select, orderBy, pageSize },
+      intentHint,
+      userText,
+    };
+
+    pushLog({ kind: "tx_agent", title: "200 /mcp/intent/query", tenant: tenantId, status: 200, relatedId: rxId, responseBody: clip({ summary, compiled: trace.compiled, table: projected }) });
+    return res.json({ ok: true, summary, table: projected, trace });
+  } catch (e) {
+    pushLog({ kind: "tx_agent", title: "500 /mcp/intent/query", tenant: tenantId, status: 500, relatedId: rxId, responseBody: String(e?.message || e), ...aiMeta });
+    return res.status(500).json({ error: "intent_query_failed", detail: String(e?.message || e) });
+  }
+});
+
+});
+
+
+
+// ---------- NLQ admin endpoints (Phase 1) ----------
+app.get("/mcp/nlq/rules", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  try {
+    const rules = readNlqRules(tenantId);
+    res.json({ tenant: tenantId, rules });
+  } catch (e) {
+    res.status(500).json({ error: "nlq_rules_read_failed", detail: String(e?.message || e) });
+  }
+});
+
+app.put("/mcp/nlq/rules", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  try {
+    writeNlqRules(tenantId, req.body || {});
+    const rules = readNlqRules(tenantId);
+    res.json({ ok: true, tenant: tenantId, rules });
+  } catch (e) {
+    res.status(500).json({ error: "nlq_rules_write_failed", detail: String(e?.message || e) });
+  }
+});
+
+app.post("/mcp/nlq/test", requireAuth(), async (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const userText = String(req.body?.userText || "");
+  const argsIn = req.body?.args || {};
+  try {
+    const t = tenantOrThrow(tenantId, requestOrigin(req));
+    const rxId = pushLog({ kind: "rx_agent", title: "POST /mcp/nlq/test", method: "POST", path: "/mcp/nlq/test", tenant: tenantId, args: clip({ userText, args: argsIn }) });
+    const out = await expandNlqToArgs({ tenantId, t, rxId, userText, args: argsIn });
+    res.json({ tenant: tenantId, input: { userText, args: argsIn }, output: out });
+  } catch (e) {
+    res.status(500).json({ error: "nlq_test_failed", detail: String(e?.message || e) });
+  }
+});
+
+
+app.get("/mcp/nlq/metadata", requireAdmin(), (req, res) => {
+  const tenantId = String(req.query.tenant || "default");
+  const which = String(req.query.which || "").toLowerCase();
+  const key = String(req.query.key || "").trim();
+  try {
+    const dir = nlqMetadataDir(tenantId);
+    if (!fs.existsSync(dir)) {
+      res.json({ tenant: tenantId, which, key, data: null });
+      return;
+    }
+    if (!which) {
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+      res.json({ tenant: tenantId, files });
+      return;
+    }
+    let filename = "";
+    if (which === "mxapiassetstatus") filename = "mxapiassetstatus.values.json";
+    if (which === "mxobjectcfg") filename = `mxobjectcfg.${String(key || "ASSET").toUpperCase()}.json`;
+    if (which === "mxapisynonymdomain") filename = `mxapisynonymdomain.${String(key || "ASSETSTATUS").toUpperCase()}.json`;
+    if (which === "mxapialndomain") filename = `mxapialndomain.${String(key || "").toUpperCase()}.json`;
+    if (!filename) {
+      res.status(400).json({ error: "bad_request", detail: `Unknown metadata type: ${which}` });
+      return;
+    }
+    const fp = path.join(dir, filename);
+    if (!fs.existsSync(fp)) {
+      res.json({ tenant: tenantId, which, key, data: null });
+      return;
+    }
+    const data = JSON.parse(fs.readFileSync(fp, "utf-8"));
+    res.json({ tenant: tenantId, which, key, data });
+  } catch (e) {
+    res.status(500).json({ error: "nlq_metadata_read_failed", detail: String(e?.message || e) });
+  }
+});
+
+app.post("/mcp/nlq/metadata/refresh", requireAdmin(), async (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const which = String(req.body?.which || req.query?.which || "mxapiassetstatus").toLowerCase();
+  const objectName = String(req.body?.object || req.query?.object || "").trim();
+  const domainId = String(req.body?.domain || req.query?.domain || "").trim();
+  try {
+    const t = tenantOrThrow(tenantId, requestOrigin(req));
+    const rxId = pushLog({ kind: "rx_agent", title: "POST /mcp/nlq/metadata/refresh", method: "POST", path: "/mcp/nlq/metadata/refresh", tenant: tenantId, args: clip({ which, object: objectName, domain: domainId }) });
+
+    if (which === "mxapiassetstatus") {
+      const values = await loadAssetStatusValues(t, tenantId, rxId);
+      res.json({ ok: true, tenant: tenantId, which, valuesCount: values.length, values });
+      return;
+    }
+
+    if (which === "mxobjectcfg") {
+      const obj = objectName || "ASSET";
+      const schema = await loadObjectCfgForObject(t, tenantId, rxId, undefined, obj);
+      res.json({ ok: true, tenant: tenantId, which, object: obj, schema });
+      return;
+    }
+
+    if (which === "mxapisynonymdomain") {
+      const dom = domainId || "ASSETSTATUS";
+      const map = await loadSynonymDomainMap(t, tenantId, rxId, undefined, dom);
+      res.json({ ok: true, tenant: tenantId, which, domain: dom, entries: Object.keys(map || {}).length });
+      return;
+    }
+
+    if (which === "mxapialndomain") {
+      if (!domainId) {
+        res.status(400).json({ error: "bad_request", detail: "domain is required for mxapialndomain" });
+        return;
+      }
+      const map = await loadAlnDomainMap(t, tenantId, rxId, undefined, domainId);
+      res.json({ ok: true, tenant: tenantId, which, domain: domainId, entries: Object.keys(map || {}).length });
+      return;
+    }
+
+    res.status(400).json({ error: "bad_request", detail: `Unknown metadata type: ${which}` });
+  } catch (e) {
+    res.status(500).json({ error: "nlq_metadata_refresh_failed", detail: String(e?.message || e) });
+  }
+});
+
+app.get("/mcp/tenants-raw", requireInternalOrAdmin(), (_req, res) => {
+  refreshTenants();
+  const tenants = Object.entries(TENANTS).map(([id, t]) => ({
+    id,
+    baseUrl: String(t?.baseUrl || ""),
+    apiKey: String(t?.apiKey || ""),
+    user: String(t?.user || ""),
+    password: String(t?.password || ""),
+    defaultSite: String(t?.defaultSite || ""),
+  })).sort((a,b) => a.id.localeCompare(b.id));
+  res.json({ tenants });
+});
+
+app.post("/mcp/call", async (req, res) => {
+  const tenantId = String(req.body?.tenant || req.query?.tenant || "default");
+  const name = String(req.body?.name || req.body?.tool || "");
+  let args = req.body?.args || {};
+
+  const userText = String(req.body?.userText || req.body?.meta?.userText || req.headers["x-user-text"] || "");
+
+  // Optional: AI provider/model metadata (for UI + observability)
+  const aiProvider = String(req.body?.meta?.aiProvider || req.body?.meta?.provider || req.headers["x-ai-provider"] || "").trim();
+  const aiModel = String(req.body?.meta?.aiModel || req.body?.meta?.model || req.headers["x-ai-model"] || "").trim();
+  const aiMeta = (aiProvider || aiModel) ? { aiProvider: aiProvider || undefined, aiModel: aiModel || undefined } : undefined;
+
+  const rxId = pushLog({
+    kind: "rx_agent",
+    title: "POST /mcp/call",
+    method: "POST",
+    path: "/mcp/call",
+    tenant: tenantId,
+    tool: name,
+    args: clip(args),
+    ...aiMeta,
+  });
+
+  try {
+    const t = tenantOrThrow(tenantId, requestOrigin(req));
+
+    // Optional per-tenant tool allowlist: if set, only tools in enabled_tools_<tenant>.json may be called.
+    const enabledTools = readEnabledTools(tenantId);
+    if (Array.isArray(enabledTools) && enabledTools.length && !enabledTools.includes(name)) {
+      pushLog({ kind: "tx_agent", title: "403 /mcp/call", tenant: tenantId, status: 403, relatedId: rxId, ...aiMeta, responseBody: clip({ error: "tool_disabled", name }) });
+      return res.status(403).json({ error: "tool_disabled", name });
+    }
+    const allowlist = readAllowlist(tenantId);
+
+    // ✅ NEW: resolve saved tool presets (dynamic OS query tools)
+    const preset = readSavedTools(tenantId).find((x) => x && x.enabled !== false && String(x.name) === name);
+    if (preset) {
+      args = {
+        // preset defaults
+        os: preset.os,
+        ...(preset.select ? { select: preset.select } : {}),
+        ...(preset.where ? { where: preset.where } : {}),
+        ...(preset.orderBy ? { orderBy: preset.orderBy } : {}),
+        ...(preset.pageSize ? { pageSize: preset.pageSize } : {}),
+        ...(preset.lean !== undefined ? { lean: preset.lean } : {}),
+        // caller overrides
+        ...(args || {}),
+      };
+    }
+
+    // If the caller accidentally put natural language into args.where (common LLM mistake),
+    // treat it as NLQ text instead of sending it to Maximo as oslc.where.
+    // Example failure mode: oslc.where="count all work orders with status WAPPR" => Maximo lexical error at "count(".
+    if (args && typeof args === "object") {
+      const w0 = String(args.where || "").trim();
+      const hasOperators = /[=!<>]/.test(w0);
+      const looksNl = w0 && !hasOperators && /\s/.test(w0) && /[A-Za-z]/.test(w0);
+      if (looksNl && !String(args.userText || "").trim()) {
+        args.userText = w0;
+        delete args.where;
+      }
+    }
+
+    if (preset || name === "maximo.queryOS" || name === "maximo_queryOS") {
+      // --- NLQ mode ---------------------------------------------------------
+      // Allow callers to send natural language (args.userText or request userText)
+      // and let the MCP server deterministically resolve the Object Structure + filters.
+      // This enables "ask anything" behavior without requiring the AI layer to guess OSLC.
+      try {
+        const nlqText = String(args?.userText || userText || "").trim();
+        const hasOs = String(args?.os || "").trim();
+        const hasWhere = String(args?.where || args?.params?.["oslc.where"] || "").trim();
+        if (nlqText && !hasOs) {
+          const out = await expandNlqToArgs({ tenantId, t, rxId, aiMeta, userText: nlqText, args });
+          if (out?.args && typeof out.args === "object") {
+            args = out.args;
+            pushLog({ kind: "info", title: "NLQ expanded to args", tenant: tenantId, relatedId: rxId, meta: clip(out?.debug || out) });
+          }
+        } else if (nlqText && hasOs && !hasWhere) {
+          // If OS is supplied but where is missing, still let NLQ attempt to derive filters/order.
+          const out = await expandNlqToArgs({ tenantId, t, rxId, aiMeta, userText: nlqText, args });
+          if (out?.args && typeof out.args === "object") {
+            args = { ...args, ...out.args };
+            pushLog({ kind: "info", title: "NLQ expanded filters", tenant: tenantId, relatedId: rxId, meta: clip(out?.debug || out) });
+          }
+        }
+      } catch (e) {
+        // Best-effort: if NLQ expansion fails, continue with the caller-supplied args.
+        pushLog({ kind: "warn", title: "NLQ expansion failed", tenant: tenantId, relatedId: rxId, meta: { message: String(e?.message || e) } });
+      }
+
+      const osIn = String(args?.os || "").trim();
+
+      // Generic OS aliasing: prefer MXAPI* object structures when callers send MX*.
+      // Examples: MXASSET -> mxapiasset, MXLOCATIONS -> mxapilocations, MXWO -> mxapiwo
+      // Disable by setting DISABLE_OS_ALIASES=true.
+      const DISABLE_OS_ALIASES = String(process.env.DISABLE_OS_ALIASES || "").toLowerCase() === "true";
+      const osNorm = String(osIn).trim().toLowerCase();
+      // Friendly aliases -> canonical MXAPI object structures
+      // This forces common short names (asset, locations, wo, sr, etc.) to their mxapi* OS names.
+      // Disable by setting DISABLE_OS_FRIENDLY_ALIASES=true.
+      const DISABLE_OS_FRIENDLY_ALIASES = String(process.env.DISABLE_OS_FRIENDLY_ALIASES || "").toLowerCase() === "true";
+      const FRIENDLY_OS_ALIASES = {
+        "asset": "mxapiasset",
+        "assets": "mxapiasset",
+        "location": "mxapilocations",
+        "locations": "mxapilocations",
+        "wo": "mxapiwo",
+        "workorder": "mxapiwo",
+        "workorders": "mxapiwo",
+        "sr": "mxapisr",
+        "servicerequest": "mxapisr",
+        "servicerequests": "mxapisr",
+        "jobplan": "mxapijobplan",
+        "jobplans": "mxapijobplan",
+        "inspectionres": "mxapiinspectionres",
+        "inspectionresults": "mxapiinspectionres",
+        "pr": "mxapipr",
+        "po": "mxapipo",
+        "inventory": "mxapiinventory",
+        "inv": "mxapiinventory",
+        "pm": "mxapipm",
+        "pms": "mxapipm"
+      };
+
+      let os = osIn;
+      // Apply friendly aliases first (asset -> mxapiasset, etc.)
+      if (!DISABLE_OS_FRIENDLY_ALIASES) {
+        const friendly = FRIENDLY_OS_ALIASES[osNorm];
+        if (friendly) {
+          os = friendly;
+        }
+      }
+
+
+      if (!DISABLE_OS_ALIASES && osNorm.startsWith("mx") && !osNorm.startsWith("mxapi")) {
+        const candidate = "mxapi" + osNorm.slice(2);
+
+        // Only apply the alias if it's allowlisted (so we don't accidentally break custom OS usage).
+        if (isAllowedOs(tenantId, candidate, allowlist)) {
+          os = candidate;
+          pushLog({
+            kind: "info",
+            title: "OS alias applied",
+            tenant: tenantId,
+            relatedId: rxId,
+            meta: { from: osIn, to: os },
+          });
+        }
+      }
+      if (!os) return res.status(400).json({ error: "bad_request", detail: "args.os is required" });
+
+      if (osIn && osIn !== os) {
+        pushLog({ kind: "info", title: "OS alias applied", tenant: tenantId, relatedId: rxId, meta: { from: osIn, to: os } });
+      }
+
+      if (!isAllowedOs(tenantId, os, allowlist)) {
+        const msg = `OS not allowed by allowlist: ${os}`;
+        pushLog({ kind: "tx_agent", title: "403 /mcp/call", tenant: tenantId, status: 403, relatedId: rxId, responseBody: msg, ...aiMeta });
+        return res.status(403).json({ error: "os_not_allowed", detail: msg });
+      }
+
+      const api = maximoApiBase(t);
+      const params = { ...(args?.params || {}) };
+      // Canonical object-structure key used throughout query shaping. Must be defined
+      // before any references to avoid TDZ errors in Node.
+      const osKey = String(os).trim().toLowerCase();
+      // ----- LLM-friendly args -> query params (backward compatible with args.params) -----
+      // If callers provide select/where/orderBy/pageSize/lean at the top-level, translate to OSLC query parameters.
+      // Prefer columns[] over select string when both are provided.
+      if (Array.isArray(args?.columns) && args.columns.length && !params["oslc.select"]) {
+        const cols = args.columns
+          .map((c) => sanitizeSelectColumn(os, c))
+          .filter((c) => c);
+        if (cols.length) params["oslc.select"] = cols.join(",");
+      }
+      if (args?.select && !params["oslc.select"]) {
+        const parsed = parseSelectColumns(String(args.select));
+        const cols = parsed.map((c) => sanitizeSelectColumn(os, c)).filter(Boolean);
+        params["oslc.select"] = cols.length ? cols.join(",") : String(args.select);
+      }
+      if (args?.where && !params["oslc.where"]) {
+        let w = String(args.where || "");
+        if (osKey === "mxapiwo") w = w.replace(/\bwo\./gi, "").replace(/\bworkorder\./gi, "");
+        params["oslc.where"] = normalizeOslcWhere(w);
+      }
+      if (args?.orderBy && !params["oslc.orderBy"]) params["oslc.orderBy"] = String(args.orderBy);
+      // If caller supplies a top-level pageSize, it should win (even if params already had oslc.pageSize).
+      if (typeof args?.pageSize !== "undefined" && args?.pageSize !== null)
+        params["oslc.pageSize"] = String(args.pageSize);
+      if (typeof args?.page !== "undefined" && args?.page !== null && !params["pageno"]) params["pageno"] = String(args.page);
+      if (typeof args?.lean !== "undefined" && args?.lean !== null && !params["lean"])
+        params["lean"] = args.lean === true ? "1" : String(args.lean);
+
+      // ----- Default query params per Object Structure (ensures tabular responses) -----
+      // These defaults apply only when the caller did not specify an explicit oslc.select / oslc.pageSize / lean.
+      const OS_DEFAULTS = {
+        mxapiasset: {
+          select: "assetnum,description,status,siteid,orgid,location,assettype,serialnum,priority,changedate",
+          pageSize: "50",
+        },
+        mxapilocations: {
+          select: "location,description,status,siteid,orgid,parent,loctype,type,changedate",
+          pageSize: "50",
+        },
+        mxapiwo: {
+          select: "wonum,description,status,worktype,priority,siteid,orgid,assetnum,location,reportdate,targstartdate,targcompdate,changedate",
+          pageSize: "50",
+        },
+        mxapisr: {
+          select: "ticketid,description,status,class,priority,siteid,orgid,assetnum,location,reportedby,reportdate,changedate",
+          pageSize: "50",
+        },
+        mxapipm: {
+          select: "pmnum,description,status,siteid,orgid,location,assetnum,freq,frequency,worktype,nextdate,changedate",
+          pageSize: "50",
+        },
+        mxapijobplan: {
+          select: "jpnum,description,status,siteid,orgid,pluscrevnum,changedate",
+          pageSize: "50",
+        },
+        mxapiinspectionres: {
+          select: "inspectionresultid,inspectionformnum,status,siteid,orgid,assetnum,location,createdate,changedate",
+          pageSize: "50",
+        },
+        mxapipr: {
+          select: "prnum,description,status,siteid,orgid,requestor,prdate,totalcost,changedate",
+          pageSize: "50",
+        },
+        mxapipo: {
+          select: "ponum,description,status,siteid,orgid,vendor,orderdate,totalcost,changedate",
+          pageSize: "50",
+        },
+        mxapiinventory: {
+          select: "itemnum,item.description,status,issueunit,location,invbalances.curbal,changedate",
+          pageSize: "25",
+        },
+      };
+
+      const def = OS_DEFAULTS[osKey];
+      if (def) {
+        if (!params["oslc.select"] || !String(params["oslc.select"]).trim()) params["oslc.select"] = def.select;
+        if (!params["oslc.pageSize"] || !String(params["oslc.pageSize"]).trim()) params["oslc.pageSize"] = def.pageSize;
+      }
+      if (!params["lean"] || !String(params["lean"]).trim()) params["lean"] = "1";
+
+      // Paging without a deterministic order can yield duplicates/overlaps across pages.
+      // If the caller asks for more than the typical per-request cap (50), provide a stable default orderBy.
+      // (If the environment rejects the orderBy, we already retry once without it; dedupe still protects output.)
+      const psNum = Number(params["oslc.pageSize"] || 0);
+      if (!params["oslc.orderBy"] && Number.isFinite(psNum) && psNum > 50) {
+        const DEFAULT_ORDER_BY = {
+          mxapiwo: "wonum",
+          mxapiasset: "assetnum",
+          mxapipm: "pmnum",
+          mxapijobplan: "jpnum",
+          mxapisr: "ticketid",
+          mxapipr: "prnum",
+          mxapipo: "ponum",
+        };
+        const ob = DEFAULT_ORDER_BY[osKey];
+        if (ob) params["oslc.orderBy"] = ob;
+      }
+
+      // If the where clause references relationship fields (rel.field), ensure those
+      // fields are included in the select so the UI can display them.
+      // Example: where contains "asset.assettype=..." => add "asset{assettype}".
+      try {
+        const w = String(params["oslc.where"] || "");
+        const sel0 = String(params["oslc.select"] || "");
+        const relFieldRefs = [];
+        const re = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
+        let m;
+        while ((m = re.exec(w))) {
+          relFieldRefs.push({ rel: m[1], field: m[2] });
+        }
+        if (relFieldRefs.length) {
+          const extra = [];
+          for (const rf of relFieldRefs) {
+            const token1 = `${rf.rel}.${rf.field}`;
+            const token2 = `${rf.rel}{${rf.field}}`;
+            if (!sel0.includes(token1) && !sel0.includes(token2)) extra.push(token2);
+          }
+          if (extra.length) params["oslc.select"] = [sel0, ...extra].filter(Boolean).join(",");
+        }
+      } catch {}
+
+      // NLQ special modes can require extra shaping BEFORE the Maximo request is executed.
+      const rkPre = String(args?._mcpResultKind || "").trim().toLowerCase();
+      if (rkPre === "related_list") {
+        const relName = String(args?._mcpRelation || "meterreading").trim() || "meterreading";
+        // Always fetch only the root record and expand the related list on it.
+        params["oslc.pageSize"] = "1";
+        const sel0 = String(params["oslc.select"] || "");
+        if (!sel0.includes(`${relName}{`)) {
+          // Be permissive; the executor will project whatever fields come back.
+          params["oslc.select"] = [sel0, `${relName}{*}`].filter(Boolean).join(",");
+        }
+      }
+
+      // ---- Schema discovery (best-effort) ----
+      // For "ask anything" reliability, we MUST avoid guessing field names.
+      // We fetch a lightweight field set for the OS and validate select/where/orderBy against it.
+      const osFields = await fetchOsFields({ tenantId, t, os, rxId });
+      const fieldsIdx = buildLowerFieldIndex(osFields);
+      let droppedWhereClauses = [];
+      let droppedOrderBy = [];
+
+      // ---- Default site filter (tenant setting) ----
+      // Ensure the tenant's default site is always applied as a key filter when the OS supports siteid,
+      // unless the caller explicitly provided a siteid filter.
+      const defaultSite = String(args?.site || t?.defaultSite || "").trim().toUpperCase();
+      const osHasSiteId = !!fieldsIdx?.has?.("siteid");
+      const where0 = String(params["oslc.where"] || "");
+      const hasSiteInWhere = /(^|\W)siteid\s*(=|!=|\bin\b)/i.test(where0);
+      if (defaultSite && osHasSiteId && !hasSiteInWhere) {
+        const siteClause = `siteid="${defaultSite}"`;
+        // Avoid parentheses; some OSLC parsers are strict.
+        params["oslc.where"] = where0 ? `${where0} and ${siteClause}` : siteClause;
+      }
+
+      // ---- Relationship-prefetch executor (generic) ----
+      // If oslc.where references relationship fields (rel.field), emulate joins via a multi-step
+      // prefetch + rewrite plan (configured per tenant).
+      let relPrefetchPlan = null;
+      if (params["oslc.where"]) {
+        const out = await applyRelationshipPrefetch({ tenantId, t, os, params, defaultSite, rxId, maximoFetch, authHeaders, maximoApiBase });
+        relPrefetchPlan = out?.plan || null;
+      }
+
+      // Validate/sanitize oslc.select against schema (drops unknown fields but keeps dot-path selectors).
+      if (params["oslc.select"]) {
+        params["oslc.select"] = sanitizeSelectWithSchema(os, params["oslc.select"], fieldsIdx);
+      }
+
+      // Validate/sanitize oslc.where against schema (drops clauses that reference non-existent fields).
+      if (params["oslc.where"]) {
+        const outW = sanitizeWhereWithSchema(os, params["oslc.where"], fieldsIdx);
+        params["oslc.where"] = outW.where;
+        droppedWhereClauses = outW.dropped || [];
+      }
+
+      // Enforce a max page size (configurable). Set MAX_PAGE_SIZE=0 to disable this cap.
+      const MAX_PAGE_SIZE = Number(process.env.MAX_PAGE_SIZE || 2000);
+      if (params["oslc.pageSize"]) {
+        const n = Number(params["oslc.pageSize"]);
+        if (!Number.isFinite(n) || n <= 0) {
+          delete params["oslc.pageSize"];
+        } else if (Number.isFinite(MAX_PAGE_SIZE) && MAX_PAGE_SIZE > 0 && n > MAX_PAGE_SIZE) {
+          params["oslc.pageSize"] = String(MAX_PAGE_SIZE);
+        }
+      }
+
+      // Normalize + validate orderBy after all sources of params have been applied.
+      // Use OS-aware normalization to strip invalid relationship prefixes and then validate
+      // identifiers against the OS schema (best-effort). This prevents "invalid OSLC order by identifier".
+      if (params["oslc.orderBy"]) {
+        const outOb = sanitizeOrderByWithSchema(os, params["oslc.orderBy"], fieldsIdx);
+        params["oslc.orderBy"] = outOb.orderBy;
+        droppedOrderBy = outOb.dropped || [];
+
+        // Some Maximo endpoints are picky and require the orderBy identifiers to be part of the projection.
+        // If an explicit oslc.select is present, ensure it includes the orderBy fields.
+        const ob = String(params["oslc.orderBy"] || "").trim();
+        const sel = String(params["oslc.select"] || "").trim();
+        if (ob && sel) {
+          const obFields = ob
+            .split(",")
+            .map((t) => String(t || "").trim())
+            .filter(Boolean)
+            .map((t) => (t[0] === "+" || t[0] === "-" ? t.slice(1) : t));
+
+          const selCols = parseSelectColumns(sel).map((c) => sanitizeSelectColumn(os, c)).filter(Boolean);
+          const have = new Set(selCols.map((x) => x.toLowerCase()));
+          let changed = false;
+          for (const f of obFields) {
+            const sf = sanitizeSelectColumn(os, f);
+            if (!sf) continue;
+            if (!have.has(sf.toLowerCase())) {
+              selCols.push(sf);
+              have.add(sf.toLowerCase());
+              changed = true;
+            }
+          }
+          if (changed) params["oslc.select"] = selCols.join(",");
+        }
+      }
+
+
+      // Normalize oslc.where:
+      // - Maximo OSLC rejects backslash-escaped quotes (e.g. \' or \"), which some LLM/tool layers may emit.
+      // - Maximo OSLC query syntax expects string literals in double quotes (field="VALUE").
+      //   If an LLM produces single-quoted literals (field='VALUE'), rewrite them.
+      if (params["oslc.where"]) {
+        let w = String(params["oslc.where"]);
+
+        // 1) Unescape LLM-style escaped quotes
+        w = w
+          .replace(/\\'/g, "'")
+          .replace(/\\"/g, '"');
+
+        // 2) Rewrite single-quoted literals to double-quoted literals
+        //    Handles: =, !=, <, <=, >, >=, like (case-insensitive)
+        //    Example: status='WAPPR' -> status="WAPPR"
+        w = w.replace(/(\b[\w\.]+\b\s*(?:=|!=|<=|>=|<|>|\blike\b)\s*)'([^']*)'/gi, (_m, lhs, val) => {
+          const safe = String(val).replace(/"/g, '\\"');
+          return `${lhs}"${safe}"`;
+        });
+
+        params["oslc.where"] = w;
+      }
+
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(params)) {
+        if (v === undefined || v === null || String(v).trim() === "") continue;
+        qs.set(k, String(v));
+      }
+
+      const url = `${api}/os/${encodeURIComponent(os)}${qs.toString() ? `?${qs.toString()}` : ""}`;
+      const headers = authHeaders(t);
+
+      let { r, respText } = await maximoFetch(t, {
+        method: "GET",
+        url,
+        headers,
+        kind: "tx_maximo",
+        title: `→ Maximo OS ${os}`,
+        meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+      });
+
+      // Some environments reject certain orderBy identifiers (e.g. changedate) depending on OSLC resource definition.
+      // If that happens, retry once without oslc.orderBy so the query still succeeds.
+      if (!r.ok && params["oslc.orderBy"] && isLikelyInvalidOrderBy(r.status, respText)) {
+        const params2 = { ...params };
+        delete params2["oslc.orderBy"];
+
+        const qs2 = new URLSearchParams();
+        for (const [k, v] of Object.entries(params2)) {
+          if (v === undefined || v === null || String(v).trim() === "") continue;
+          qs2.set(k, String(v));
+        }
+        const url2 = `${api}/os/${encodeURIComponent(os)}${qs2.toString() ? `?${qs2.toString()}` : ""}`;
+
+        const retry = await maximoFetch(t, {
+          method: "GET",
+          url: url2,
+          headers,
+          kind: "tx_maximo",
+          title: `→ Maximo OS ${os} (retry without orderBy)`,
+          meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+        });
+        r = retry.r;
+        respText = retry.respText;
+        // Keep params in sync for downstream projection/logging
+        delete params["oslc.orderBy"];
+      }
+
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      let bodyOutRaw = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+
+      // If the caller requested a larger pageSize than the server returns per request (often capped at 50),
+      // opportunistically fetch additional pages (OSLC startIndex) and stitch members together up to oslc.pageSize.
+      // This keeps the UX intuitive: pageSize=200 returns up to 200 rows.
+      if (r.status >= 200 && r.status < 300 && ct.includes("application/json")) {
+        const requestedMax = Number(params["oslc.pageSize"] || 0);
+        const pageNo = Number(params["pageno"] || 1);
+        if (Number.isFinite(requestedMax) && requestedMax > 0) {
+          const firstBody = safeJson(respText);
+          if (firstBody && typeof firstBody === "object") {
+            const firstMembers = getOslcMembers(firstBody);
+            const totalCount = getOslcTotalCount(firstBody);
+            const nextHref = getOslcNextPageHref(firstBody);
+
+            const tcNum = Number(totalCount);
+            const hasTotal = Number.isFinite(tcNum) && tcNum > 0;
+
+            // If totalCount is known and larger, we definitely have more.
+            // If nextPage is present, we likely have more.
+            // If requestedMax > 50 and we got 50, many Manage environments are capped per request.
+            const shouldPage =
+              requestedMax > firstMembers.length &&
+              (
+                (hasTotal && tcNum > firstMembers.length) ||
+                !!nextHref ||
+                (requestedMax > 50 && firstMembers.length >= 50)
+              );
+
+            if (shouldPage && firstMembers.length > 0) {
+              // Start with the first page, but dedupe defensively.
+              const combined = dedupeOslcMembers(os, firstMembers);
+              const seenKeys = new Set();
+              for (const m of combined) {
+                const k = oslcMemberKey(os, m);
+                if (k) seenKeys.add(k);
+              }
+
+              let startIndex = Number(params["oslc.startIndex"] || 0);
+              if (!Number.isFinite(startIndex) || startIndex < 1) {
+                startIndex = ((Number.isFinite(pageNo) && pageNo > 1) ? ((pageNo - 1) * requestedMax + 1) : 1);
+              }
+              let nextStart = startIndex + firstMembers.length;
+
+              // Guard against runaway paging. Default at most 20 extra pages.
+              const maxPages = Math.min(20, Math.ceil(Math.max(0, requestedMax - combined.length) / 25) + 3);
+              for (let i = 0; i < maxPages && combined.length < requestedMax; i++) {
+                const paramsN = { ...params, "oslc.startIndex": String(nextStart) };
+
+                const qsN = new URLSearchParams();
+                for (const [k, v] of Object.entries(paramsN)) {
+                  if (v === undefined || v === null || String(v).trim() === "") continue;
+                  qsN.set(k, String(v));
+                }
+
+                const urlN = `${api}/os/${encodeURIComponent(os)}${qsN.toString() ? `?${qsN.toString()}` : ""}`;
+                const next = await maximoFetch(t, {
+                  method: "GET",
+                  url: urlN,
+                  headers,
+                  kind: "tx_maximo",
+                  title: `→ Maximo OS ${os} (page ${i + 2})`,
+                  meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+                });
+
+                if (!next.r.ok) break;
+                const ctN = (next.r.headers.get("content-type") || "").toLowerCase();
+                if (!ctN.includes("application/json")) break;
+                const bodyN = safeJson(next.respText);
+                if (!bodyN || typeof bodyN !== "object") break;
+
+                const memN = getOslcMembers(bodyN);
+                if (!memN.length) break;
+
+                // Append new members while avoiding duplicates across overlapping pages.
+                for (const m of memN) {
+                  const k = oslcMemberKey(os, m);
+                  if (k) {
+                    if (seenKeys.has(k)) continue;
+                    seenKeys.add(k);
+                  }
+                  combined.push(m);
+                }
+                nextStart += memN.length;
+
+                // If the server returns less than the first page size, we likely hit the end.
+                // (We don't know the server cap, but this is a safe early-exit.)
+                if (memN.length < firstMembers.length) {
+                  // If totalCount indicates more, keep going; otherwise stop.
+                  if (!(hasTotal && tcNum > combined.length)) break;
+                }
+              }
+
+              const sliced = combined.slice(0, requestedMax);
+              bodyOutRaw = setOslcMembers(firstBody, sliced);
+            }
+          }
+        }
+      }
+
+      // By default, return only the requested oslc.select columns (no *_collectionref / href / _rowstamp noise).
+      // Set args.rawResponse=true to return the raw Maximo response instead.
+      let bodyOut = bodyOutRaw;
+
+      // --- Special result kinds for NLQ mode (no LLM guessing) ---
+      // These are set by expandNlqToArgs via _mcpResultKind.
+      const rk = String(args?._mcpResultKind || "").trim().toLowerCase();
+
+      // A) Related list extraction (e.g. "last meter readings for asset ...")
+      if (rk === "related_list" && r.status >= 200 && r.status < 300 && ct.includes("application/json")) {
+        const relNameReq = String(args?._mcpRelation || "").trim() || "meterreading";
+        const limit = Number(args?._mcpLimit || 10);
+
+        // Ensure select contains a nested relationship selection.
+        // If the caller already set a relationship brace select, keep it.
+        const sel0 = String(params["oslc.select"] || "");
+        if (!sel0.includes("{") && !sel0.includes(`${relNameReq}{`)) {
+          params["oslc.select"] = [sel0, `${relNameReq}{*}`].filter(Boolean).join(",");
+        }
+
+        const j = bodyOutRaw;
+        const root = j?.member?.[0] || j?.["rdfs:member"]?.[0] || null;
+        const relArr = root?.[relNameReq] || root?.[String(relNameReq).toLowerCase()] || [];
+        const arr = Array.isArray(relArr) ? relArr : (relArr ? [relArr] : []);
+
+        // Prefer sorting by a date-like field when present
+        const dateField = ["readingdate", "recorddate", "changedate"].find(f => arr.length && arr[0] && Object.prototype.hasOwnProperty.call(arr[0], f)) || null;
+        const sorted = dateField ? arr.slice().sort((a,b) => String(b?.[dateField]||"").localeCompare(String(a?.[dateField]||""))) : arr;
+        const out = sorted.slice(0, Math.min(Math.max(1, limit), sorted.length));
+
+        const cols = Object.keys(out?.[0] || {});
+        const table = {
+          columns: cols,
+          rows: out.map(o => cols.reduce((acc, c) => { acc[c] = o?.[c] ?? ""; return acc; }, {}))
+        };
+
+        bodyOut = {
+          kind: "related_list",
+          relation: relNameReq,
+          summary: `Found ${out.length} ${relNameReq} records${dateField ? ` (sorted by ${dateField})` : ""}.`,
+          table,
+        };
+      }
+
+      // B) Aggregate (count + optional breakdown) — return narrative, not a row table.
+      if (rk === "aggregate" && r.status >= 200 && r.status < 300 && ct.includes("application/json")) {
+        const gb = Array.isArray(args?._mcpGroupBy) ? args._mcpGroupBy : [];
+        const gbFields = gb.map(x => String(x||"").trim()).filter(Boolean);
+
+        // Build rows from the (potentially multi-page) response
+        const members = getOslcMembers(bodyOutRaw);
+        const tc = getOslcTotalCount(bodyOutRaw);
+        const total = (typeof tc !== "undefined" && tc !== null && !Number.isNaN(Number(tc))) ? Number(tc) : members.length;
+        const breakdown = new Map();
+        if (gbFields.length) {
+          for (const m of members) {
+            const k = gbFields.map(f => String(m?.[f] ?? "")).join(" | ");
+            breakdown.set(k, (breakdown.get(k) || 0) + 1);
+          }
+        }
+        const top = Array.from(breakdown.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 25);
+        const detail = top.map(([group, count]) => ({ group, count }));
+
+        bodyOut = {
+          kind: "aggregate",
+          summary: gbFields.length
+            ? `There are ${total} matching records, grouped by ${gbFields.join(", ")}${(members.length && members.length !== total) ? ` (breakdown sampled from ${members.length} rows)` : ""}.`
+            : `There are ${total} matching records.`,
+          detail,
+          sampled: members.length && members.length !== total,
+        };
+      }
+
+      if (bodyOut === bodyOutRaw && !(args?.rawResponse === true) && r.status >= 200 && r.status < 300 && ct.includes("application/json")) {
+        const cols = parseSelectColumns(params["oslc.select"] || "");
+        if (cols.length) bodyOut = projectOslcResponseToTable(os, bodyOutRaw, cols, { pageSize: Number(params["oslc.pageSize"] || 0), page: Number(params["pageno"] || 1) });
+      }
+
+      // Surface schema-driven adjustments so we don't silently return "wrong" answers.
+      // If we had to drop filters/sorts because fields don't exist in this OS,
+      // include a small diagnostic payload the UI can show/log.
+      if (bodyOut && typeof bodyOut === "object") {
+        const diag = {};
+        if (Array.isArray(droppedWhereClauses) && droppedWhereClauses.length) diag.droppedWhere = droppedWhereClauses;
+        if (Array.isArray(droppedOrderBy) && droppedOrderBy.length) diag.droppedOrderBy = droppedOrderBy;
+        if (relPrefetchPlan && typeof relPrefetchPlan === "object") diag.plan = relPrefetchPlan;
+        if (Object.keys(diag).length) bodyOut._mcp = { ...(bodyOut._mcp || {}), ...diag };
+      }
+
+      pushLog({
+        kind: "tx_agent",
+        title: `${r.status} /mcp/call`,
+        tenant: tenantId,
+        status: r.status,
+        relatedId: rxId,
+        responseBody: clip(bodyOut),
+        ...aiMeta,
+      });
+
+      if (req._nlqDebug) {
+        // Attach NLQ debug under _nlq when requested (debugNlq=1)
+        if (bodyOut && typeof bodyOut === "object") bodyOut._nlq = req._nlqDebug;
+      }
+      return res.status(r.status).json(bodyOut);
+    }
+
+    if (name === "maximo_listAssets") {
+      const site = String(args?.site || "").trim().toUpperCase();
+      const search = String(args?.search || "").trim().toLowerCase();
+      const pageSize = Number(args?.pageSize || 100);
+      if (!site) return res.status(400).json({ error: "bad_request", detail: "args.site is required" });
+
+      // Reuse the queryOS path for a safe value list.
+      const qArgs = {
+        // Prefer mxapiasset but support environments that expose older mxasset OS names.
+        os: "mxapiasset",
+        columns: ["assetnum", "description", "status", "siteid"],
+        where: `siteid=\"${site}\"`,
+        // OSLC requires + / - sort sign. Default ascending.
+        orderBy: "+assetnum",
+        pageSize: String(Math.max(1, Math.min(500, pageSize))),
+        lean: true,
+      };
+
+      // Call our own query handler by issuing an internal HTTP request is overkill.
+      // Instead, share the same code path by reconstructing the OSLC request here.
+      const api = maximoApiBase(t);
+
+      // Some environments are picky about quoting in oslc.where.
+      // We'll try a double-quote variant first, then single-quote if we see a where-clause parse error.
+      const whereVariants = [
+        `siteid=\"${site}\"`,
+        `siteid='${site}'`,
+        "", // Fallback: some environments reject where clauses; we'll filter client-side.
+      ];
+      // Try mxapiasset first; fall back to mxasset if the OS isn't present.
+      const candidatesAll = ["mxapiasset", "mxasset"];
+      const candidates = (allowlist && allowlist.length)
+        ? candidatesAll.filter((osName) => isAllowedOs(tenantId, osName, allowlist))
+        : candidatesAll;
+      if (!candidates.length) {
+        const msg = `OS not allowed by allowlist: ${candidatesAll.join(", ")}`;
+        pushLog({ kind: "tx_agent", title: "403 /mcp/call", tenant: tenantId, status: 403, relatedId: rxId, responseBody: msg, ...aiMeta });
+        return res.status(403).json({ error: "os_not_allowed", detail: msg });
+      }
+
+      let usedOs = candidates[0];
+      let usedWhere = whereVariants[0];
+      let r = null;
+      let respText = "";
+      outer: for (const osName of candidates) {
+        usedOs = osName;
+        // Try both where variants if needed.
+        for (let wi = 0; wi < whereVariants.length; wi++) {
+          usedWhere = whereVariants[wi];
+          const params = {
+            "oslc.select": qArgs.columns.join(","),
+            ...(usedWhere ? { "oslc.where": usedWhere } : {}),
+            "oslc.orderBy": normalizeOrderBy(qArgs.orderBy),
+            "oslc.pageSize": qArgs.pageSize,
+            "lean": "1",
+          };
+          const qs = new URLSearchParams();
+          for (const [k, v] of Object.entries(params)) {
+            if (v === undefined || v === null || String(v).trim() === "") continue;
+            qs.set(k, String(v));
+          }
+
+          const url = `${api}/os/${encodeURIComponent(osName)}?${qs.toString()}`;
+          const out = await maximoFetch(t, {
+            method: "GET",
+            url,
+            headers: { ...authHeaders(t), accept: "application/json" },
+            kind: "tx_maximo",
+            title: `→ Maximo LIST assets (${site})`,
+            meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+          });
+          r = out.r;
+          respText = out.respText;
+
+          if (r.ok) break outer;
+
+          // If the OS name isn't present, Maximo often returns 404 or a 400 containing a "not defined" style error.
+          if (isLikelyOsNotFound(r.status, respText)) {
+            // Try next OS candidate.
+            break;
+          }
+
+          // If where-clause looks invalid, try the next where variant (if available).
+          if (isLikelyWhereClauseError(r.status, respText) && wi < whereVariants.length - 1) {
+            continue;
+          }
+
+          // Other errors: stop trying.
+          break outer;
+        }
+      }
+
+      if (!r) {
+        return res.status(500).json({ error: "maximo_failed", detail: "Asset list request failed." });
+      }
+
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const bodyRaw = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+
+      // If Maximo returns an error status, do NOT project to table — surface the real error message.
+      if (!r.ok) {
+        const msg = extractMaximoErrorMessage(bodyRaw, respText) || String(respText || "").slice(0, 600);
+        const outErr = {
+          error: "maximo_error",
+          status: r.status,
+          os: String(usedOs),
+          where: String(usedWhere || ""),
+          detail: msg,
+        };
+        pushLog({
+          kind: "tx_agent",
+          title: `${r.status} /mcp/call`,
+          tenant: tenantId,
+          status: r.status,
+          relatedId: rxId,
+          responseBody: clip(outErr),
+          ...aiMeta,
+        });
+        return res.status(r.status).json(outErr);
+      }
+
+      const projected = ct.includes("application/json")
+        ? projectOslcResponseToTable(String(usedOs), bodyRaw, qArgs.columns, { pageSize: Number(qArgs.pageSize), page: 1 })
+        : bodyRaw;
+
+      let rows = Array.isArray(projected?.rows) ? projected.rows : [];
+
+      // If we couldn't apply a where-clause (usedWhere=""), filter by site client-side when possible.
+      if (!usedWhere) {
+        rows = rows.filter((x) => {
+          const s = String(x?.siteid || "").trim().toUpperCase();
+          // Keep rows with matching siteid; if siteid is absent, keep it (can't reliably filter).
+          return !s || s === site;
+        });
+      }
+
+      const filtered = search
+        ? rows.filter((x) => {
+            const a = String(x?.assetnum || "").toLowerCase();
+            const d = String(x?.description || "").toLowerCase();
+            return a.includes(search) || d.includes(search);
+          })
+        : rows;
+      const items = filtered.slice(0, 200).map((x) => ({
+        id: String(x?.assetnum || ""),
+        assetnum: String(x?.assetnum || ""),
+        description: String(x?.description || ""),
+        status: String(x?.status || ""),
+        siteid: String(x?.siteid || site),
+        label: `${String(x?.assetnum || "")} — ${String(x?.description || "")}`.trim(),
+      })).filter((it) => it.id);
+
+      const out = { items, table: { columns: projected?.columns || qArgs.columns, rows: filtered.slice(0, 200) } };
+
+      pushLog({
+        kind: "tx_agent",
+        title: `${r.status} /mcp/call`,
+        tenant: tenantId,
+        status: r.status,
+        relatedId: rxId,
+        responseBody: clip({ items: items.slice(0, 20), count: items.length }),
+        ...aiMeta,
+      });
+      return res.status(r.status).json(out);
+    }
+
+    if (name === "maximo_createWO" || name === "maximo_createSR") {
+      const site = String(args?.site || "").trim().toUpperCase();
+      const assetnum = String(args?.assetnum || "").trim();
+      const priority = args?.priority != null ? String(args.priority) : "";
+      const description = String(args?.description || "").trim();
+      const fields = (args?.fields && typeof args.fields === "object") ? args.fields : {};
+      if (!site || !description) return res.status(400).json({ error: "bad_request", detail: "args.site and args.description are required" });
+
+      // Prefer mxapi* OS names, but support environments that expose legacy mxwo/mxsr.
+      const osCandidatesAll = name === "maximo_createWO" ? ["mxapiwo", "mxwo"] : ["mxapisr", "mxsr"];
+      const osCandidates = (allowlist && allowlist.length)
+        ? osCandidatesAll.filter((osName) => isAllowedOs(tenantId, osName, allowlist))
+        : osCandidatesAll;
+      if (!osCandidates.length) {
+        const msg = `OS not allowed by allowlist: ${osCandidatesAll.join(", ")}`;
+        pushLog({ kind: "tx_agent", title: "403 /mcp/call", tenant: tenantId, status: 403, relatedId: rxId, responseBody: msg, ...aiMeta });
+        return res.status(403).json({ error: "os_not_allowed", detail: msg });
+      }
+
+      const api = maximoApiBase(t);
+      const body = {
+        siteid: site,
+        description,
+        ...(assetnum ? { assetnum } : {}),
+        ...(priority ? { priority } : {}),
+        ...(fields || {}),
+      };
+
+      let usedOs = osCandidates[0];
+      let r = null;
+      let respText = "";
+      for (const osName of osCandidates) {
+        usedOs = osName;
+        const url = `${api}/os/${encodeURIComponent(osName)}?lean=1`;
+        const out = await maximoFetch(t, {
+          method: "POST",
+          url,
+          headers: { ...authHeaders(t), "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(body),
+          kind: "tx_maximo",
+          title: `→ Maximo CREATE ${osName} (${site})`,
+          meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+        });
+        r = out.r;
+        respText = out.respText;
+        if (r.ok) break;
+        const notFound = r.status === 404 || (r.status === 400 && /not\s+found/i.test(respText));
+        if (!notFound) break;
+      }
+
+      if (!r) return res.status(500).json({ error: "maximo_failed", detail: "Create request failed." });
+
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const bodyOut = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+
+      // Best-effort id extraction
+      const id = bodyOut?.wonum || bodyOut?.ticketid || bodyOut?.srnum || bodyOut?.workorderid || "";
+      const out = { ok: r.ok, os: usedOs, id: String(id || ""), response: bodyOut };
+
+      pushLog({
+        kind: "tx_agent",
+        title: `${r.status} /mcp/call`,
+        tenant: tenantId,
+        status: r.status,
+        relatedId: rxId,
+        responseBody: clip(out),
+        ...aiMeta,
+      });
+      return res.status(r.status).json(out);
+    }
+
+    if (name === "maximo.raw" || name === "maximo_raw") {
+      const method = String(args?.method || "GET").toUpperCase();
+      const p = String(args?.path || "").trim();
+      const query = args?.query && typeof args.query === "object" ? args.query : {};
+      const body = args?.body;
+
+      const api = maximoApiBase(t);
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) {
+        if (v === undefined || v === null || String(v).trim() === "") continue;
+        qs.set(k, String(v));
+      }
+
+      const url = `${api}${p.startsWith("/") ? "" : "/"}${p}${qs.toString() ? `?${qs.toString()}` : ""}`;
+      const headers = { ...authHeaders(t), "content-type": "application/json" };
+      const bodyStr = ["GET", "HEAD"].includes(method) ? undefined : JSON.stringify(body ?? {});
+
+      const { r, respText } = await maximoFetch(t, {
+        method,
+        url,
+        headers,
+        body: bodyStr,
+        kind: "tx_maximo",
+        title: `→ Maximo RAW ${method} ${p}`,
+        meta: { tool: name, relatedId: rxId, ...(aiMeta || {}) },
+      });
+
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      const bodyOut = ct.includes("application/json") ? (safeJson(respText) ?? { raw: respText }) : { raw: respText };
+
+      pushLog({
+        kind: "tx_agent",
+        title: `${r.status} /mcp/call`,
+        tenant: tenantId,
+        status: r.status,
+        relatedId: rxId,
+        responseBody: clip(bodyOut),
+        ...aiMeta,
+      });
+
+      if (req._nlqDebug) {
+        // Attach NLQ debug under _nlq when requested (debugNlq=1)
+        if (bodyOut && typeof bodyOut === "object") bodyOut._nlq = req._nlqDebug;
+      }
+      return res.status(r.status).json(bodyOut);
+    }
+
+    const msg = `Unknown tool: ${name}`;
+    pushLog({ kind: "tx_agent", title: "400 /mcp/call", tenant: tenantId, status: 400, relatedId: rxId, responseBody: msg, ...aiMeta });
+    return res.status(400).json({ error: "unknown_tool", detail: msg });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    pushLog({ kind: "tx_agent", title: "500 /mcp/call", tenant: tenantId, status: 500, relatedId: rxId, responseBody: msg, ...aiMeta });
+    return res.status(500).json({ error: "mcp_failed", detail: msg });
+  }
+});
+
+// ---------- relationships registry API (admin-only) ----------
+function relPaths(tenant){
+  const baseDir = path.join("/data", "relationships");
+  const defaultsFile = path.join(baseDir, "relationships.defaults.json");
+  const tenantFile = path.join(baseDir, "relationships."+tenant+".json");
+  const backupsDir = path.join(baseDir, "backups");
+  return { baseDir, defaultsFile, tenantFile, backupsDir };
+}
+function readJsonSafe(fp){ try{ if(!fs.existsSync(fp)) return null; const txt=fs.readFileSync(fp,"utf8"); return JSON.parse(txt||"{}"); } catch(e){ return { _error: String(e?.message||e) }; } }
+function normalizeRelFile(j){ if(!j) return { relationships: [] }; if(Array.isArray(j)) return { relationships: j }; if(Array.isArray(j.relationships)) return j; return { relationships: [] }; }
+app.get("/api/relationships", requireAdmin(), (req,res)=>{
+  const tenant = String(req.query.tenant || "default");
+  const scope = String(req.query.scope || "effective");
+  const { baseDir, defaultsFile, tenantFile } = relPaths(tenant);
+  const defaultsJ = normalizeRelFile(readJsonSafe(defaultsFile));
+  const tenantJ = normalizeRelFile(readJsonSafe(tenantFile));
+  let payload;
+  if(scope==="defaults") payload = defaultsJ;
+  else if(scope==="tenant") payload = tenantJ;
+  else {
+    const key = (r)=> (r.rootOs||"")+"::"+(r.alias||"");
+    const m = new Map();
+    for(const r of (defaultsJ.relationships||[])) m.set(key(r), r);
+    for(const r of (tenantJ.relationships||[])) m.set(key(r), r);
+    payload = { relationships: Array.from(m.values()) };
+  }
+  return res.json({ tenant, scope, ...payload });
+});
+app.put("/api/relationships", requireAdmin(), express.json({ limit: "2mb" }), (req,res)=>{
+  const tenant = String(req.query.tenant || "default");
+  const scope = String(req.query.scope || "tenant");
+  const body = req.body || {};
+  const rels = Array.isArray(body.relationships) ? body.relationships : (Array.isArray(body) ? body : []);
+  const clean = { relationships: rels };
+  const { baseDir, defaultsFile, tenantFile, backupsDir } = relPaths(tenant);
+  fs.mkdirSync(baseDir, { recursive:true }); fs.mkdirSync(backupsDir, { recursive:true });
+  const target = scope==="defaults" ? defaultsFile : tenantFile;
+  const ts = new Date().toISOString().replace(/[:.]/g,"");
+  try { if(fs.existsSync(target)) fs.copyFileSync(target, path.join(backupsDir, path.basename(target)+"."+ts)); } catch {}
+  writeJsonAtomic(target, clean);
+  return res.json({ ok:true, tenant, scope, saved: target, count: rels.length });
+});
+// ---------- static UI + SPA fallback ----------
+const publicDir = path.join(process.cwd(), "public");
+app.use(express.static(publicDir, {
+  setHeaders: (res, filePath) => {
+    // Prevent stale UI bundles after redeploys (especially across clusters / routes).
+    res.setHeader("Cache-Control", "no-store");
+  }
+}));
+app.get(/^\/(?!api\/|mcp\/|healthz).*/, (req, res, next) => {
+  const indexFile = path.join(publicDir, "index.html");
+  try {
+    if (fs.existsSync(indexFile)) { res.setHeader("Cache-Control", "no-store"); return res.sendFile(indexFile); }
+  } catch {}
+  return next();
+});
+
+app.listen(PORT, () => {
+  console.log(`mcp-server listening on :${PORT}`);
+});
